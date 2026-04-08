@@ -8,7 +8,7 @@ binding = "DAYA_KV"
 id = "7d313eeaaa5d4a50b3f779f9e0c7f180"
 
 [triggers]
-crons = ["0 */12 * * *", "0 5 * * *"]
+crons = ["0 */12 * * *", "0 3 * * *"]
 
 [[queues.producers]]
 queue = "daya-email-queue"

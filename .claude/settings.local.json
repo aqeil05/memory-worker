@@ -21,7 +21,8 @@
       "Bash(source '/Users/aqeil/development/memory worker/.env')",
       "Bash(curl -s -X GET https://daya-memory-worker.daya-timesheet.workers.dev/run-daily-summaries -H 'Authorization: Bearer $INTERNAL_SECRET')",
       "Bash(python3 -m json.tool)",
-      "Bash(mkdir -p ~/.traycer/yolo_artifacts)"
+      "Bash(mkdir -p ~/.traycer/yolo_artifacts)",
+      "Read(//Users/aqeil/.traycer/yolo_artifacts/**)"
     ]
   }
 }

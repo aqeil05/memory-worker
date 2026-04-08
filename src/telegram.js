@@ -132,7 +132,6 @@ async function handleBotCommand(env, chatId, text) {
 
   // /bot summary — full project briefing
   if (lowerQ === "summary") {
-    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Generating project briefing...");
     const { text: summaryText, json } = await handleSummary(env, chatId, project);
     await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, summaryText);
 

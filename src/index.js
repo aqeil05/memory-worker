@@ -147,14 +147,15 @@ export default {
   },
 
   // ── Cron handlers ─────────────────────────────────────────────────────────
-  // "0 5 * * *"    → 08:00 Qatar (UTC+3) — pre-generate & cache daily summaries
+  // "0 3 * * *"    → 06:00 Qatar (UTC+3) — pre-generate & cache daily summaries
   // "0 */12 * * *" → every 12h           — renew Graph email subscriptions
   async scheduled(event, env, ctx) {
-    if (event.cron === "0 5 * * *") {
-      ctx.waitUntil(
-        generateDailySummaries(env)
-          .catch(err => console.error(`generateDailySummaries crashed: ${err.stack || err.message}`))
-      );
+    if (event.cron === "0 3 * * *") {
+      try {
+        await generateDailySummaries(env);
+      } catch (err) {
+        console.error(`generateDailySummaries crashed: ${err.stack || err.message}`);
+      }
     } else {
       ctx.waitUntil(
         renewSubscriptions(env)

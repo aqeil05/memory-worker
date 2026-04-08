@@ -145,13 +145,25 @@ async function getKVFacts(env, company) {
 }
 
 // Returns the list of company keys that would match a given company string —
-// used by /link to tell the admin what was found in the database.
+// used by /link to tell the admin what was found in the database, and by
+// handleSummary() to locate pre-generated caches for fuzzy-linked groups.
+// Mirrors the exact-first resolution semantics of getKVFacts() so that all
+// callers see consistent behaviour:
+//   1. If the company key exists verbatim, return only that key (authoritative).
+//   2. Otherwise return all fuzzy-matched keys from the current mem:co:* index.
 export async function matchingCompanies(env, company) {
   const normalized = company.toLowerCase().trim();
-  const allCompanies = await env.DAYA_KV.get("mem:companies", "json") || [];
+  const allCompanies = await getAllCompanies(env);
+
+  // Exact-first rule: mirrors getKVFacts() — if the linked key exists verbatim,
+  // return only it so callers don't broaden to fuzzy candidates unnecessarily.
+  if (allCompanies.includes(normalized)) {
+    return [normalized];
+  }
+
+  // Fuzzy fallback: only when no exact key exists in the current index.
   const queryWords = new Set(normalized.split(/\s+/).filter(w => w.length >= 3));
   return allCompanies.filter(co => {
-    if (co === normalized) return true;
     const coWords = co.split(/\s+/);
     return coWords.some(w => w.length >= 3 && queryWords.has(w)) ||
       [...queryWords].some(w => co.includes(w));
