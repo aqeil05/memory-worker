@@ -98,6 +98,34 @@ export async function appendFacts(env, factRows) {
   }
 }
 
+// ── Merge company ─────────────────────────────────────────────────────────────
+// Moves all facts from `from` key → `into` key (with dedup), then deletes stale keys.
+// Safe to re-run — appendFacts is idempotent on (emailDate|fact).
+
+export async function mergeCompany(env, from, into) {
+  from = (from || "").toLowerCase().trim();
+  into = (into || "").toLowerCase().trim();
+  if (!from || !into) throw new Error("Both from and into are required");
+  if (from === into) throw new Error("from and into must be different");
+
+  const fromFacts = await env.DAYA_KV.get(`mem:facts:${from}`, "json") || [];
+  if (fromFacts.length === 0) {
+    return { moved: 0, from, into };
+  }
+
+  const retagged = fromFacts.map(f => ({ ...f, company: into }));
+  await appendFacts(env, retagged);
+
+  await Promise.all([
+    env.DAYA_KV.delete(`mem:facts:${from}`),
+    env.DAYA_KV.delete(`mem:co:${from}`),
+    env.DAYA_KV.delete(`summary:cache:${from}`),
+  ]);
+
+  console.log(`mergeCompany: moved ${fromFacts.length} facts from "${from}" → "${into}"`);
+  return { moved: fromFacts.length, from, into };
+}
+
 // ── KV fact readers ────────────────────────────────────────────────────────────
 // getKVFacts uses fuzzy word matching so "/link Malomatia 19th Floor" finds
 // facts stored under "malomatia", "malomatia qatar", etc.
@@ -207,6 +235,34 @@ export async function getAllCompanies(env) {
   // Fallback: scan mem:facts: directly (handles missing index)
   const factsList = await env.DAYA_KV.list({ prefix: "mem:facts:" });
   return factsList.keys.map(k => k.name.slice("mem:facts:".length));
+}
+
+// ── Active project list ───────────────────────────────────────────────────────
+// mem:projects → JSON array of canonical lowercase project names.
+// Used by extractEmailFacts to guide Claude's project matching so new emails
+// always land under a canonical key instead of a freeform invented name.
+
+export async function getActiveProjects(env) {
+  const raw = await env.DAYA_KV.get("mem:projects", "json");
+  return Array.isArray(raw) ? raw : [];
+}
+
+export async function addActiveProject(env, name) {
+  const normalized = name.toLowerCase().trim();
+  if (!normalized) throw new Error("Project name cannot be empty");
+  const current = await getActiveProjects(env);
+  if (current.includes(normalized)) return { added: false, name: normalized };
+  await env.DAYA_KV.put("mem:projects", JSON.stringify([...current, normalized].sort()));
+  return { added: true, name: normalized };
+}
+
+export async function archiveProject(env, name) {
+  const normalized = name.toLowerCase().trim();
+  const current = await getActiveProjects(env);
+  const filtered = current.filter(p => p !== normalized);
+  if (filtered.length === current.length) return { removed: false, name: normalized };
+  await env.DAYA_KV.put("mem:projects", JSON.stringify(filtered));
+  return { removed: true, name: normalized };
 }
 
 // ── Upload a file to OneDrive/Memory Worker/Reports/ and return webUrl ─────────

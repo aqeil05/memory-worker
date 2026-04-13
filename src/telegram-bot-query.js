@@ -4,11 +4,11 @@
 
 import { queryFacts, getRecentFacts, getAllProjectFacts, getAllCompanies, matchingCompanies } from "./onedrive.js";
 import { getBotHistory, setBotHistory, setBotPending } from "./dedup.js";
-import { escHtml } from "./notify.js";
+import { escHtml, sendChatAction } from "./notify.js";
 import { claudeFetch } from "./memory.js";
 
 const CLAUDE_API = "https://api.anthropic.com/v1/messages";
-const SONNET_MODEL = "claude-sonnet-4-5";
+const SONNET_MODEL = "claude-sonnet-4-6";
 const HAIKU_MODEL = "claude-haiku-4-5";
 
 const SUMMARY_CACHE_PREFIX = "summary:cache:";
@@ -17,9 +17,8 @@ const SUMMARY_DAYS_WINDOW  = 10;
 const SUMMARY_CHUNK_SIZE   = 40; // facts per Haiku chunk in two-pass summary
 
 // Q&A retrieval thresholds
-const QA_LARGE_THRESHOLD = 80;  // fact count above which Haiku shortlist path activates
-const QA_RECENCY_TAIL    = 10;  // most-recent facts always included in large-project shortlist
-const QA_MAX_SHORTLIST   = 40;  // cap on facts sent to Sonnet for Q&A
+const QA_MAX_SHORTLIST = 120;  // max facts sent to Sonnet for Q&A
+const REPORT_MAX_SHORTLIST = 200;  // broader than Q&A — reports need the full story
 
 const QA_SYSTEM_PROMPT = `You are Daya Assistant, internal AI for Daya Interior Design (Doha, Qatar) — a fit-out, interior design, and project management company.
 
@@ -78,48 +77,24 @@ export async function handleBotQuery(env, chatId, question, project, isClarifica
   });
   const totalCount = allFacts.length;
 
-  let contextFacts;
-  let relevantFacts;
+  // Compute full date range from all facts so Claude always knows the true span,
+  // even when only a shortlist is sent as context.
+  const allDates = allFacts.map(r => r.emailDate?.slice(0, 10)).filter(Boolean).sort();
+  const fullDateRange = allDates.length > 0 ? `${allDates[0]} to ${allDates[allDates.length - 1]}` : null;
 
-  if (totalCount > QA_LARGE_THRESHOLD) {
-    // Large project: build a compact fact index, ask Haiku for relevant indices,
-    // then keep a recency tail so the most recent activity is always present.
-    const indices = await shortlistQAFactsWithHaiku(env, question, allFacts).catch((err) => {
-      console.warn(`Haiku Q&A shortlist failed, falling back to recency tail: ${err.message}`);
-      return [];
-    });
-
-    // Always include the most-recent QA_RECENCY_TAIL facts.
-    const recencySet = new Set();
-    for (let i = Math.max(0, totalCount - QA_RECENCY_TAIL); i < totalCount; i++) {
-      recencySet.add(i);
-    }
-
-    // Reserve the recency tail first — these indices cannot be dropped by the cap.
-    const tailIndices = [...recencySet].sort((a, b) => a - b);
-
-    // Fill remaining budget from Haiku-selected indices, excluding already-reserved tail.
-    const remainingBudget = QA_MAX_SHORTLIST - tailIndices.length;
-    const haikuIndices = indices
-      .filter(i => Number.isInteger(i) && i >= 0 && i < totalCount && !recencySet.has(i))
-      .slice(0, remainingBudget);
-
-    // Merge, de-duplicate, restore chronological order.
-    const finalIndices = [...new Set([...haikuIndices, ...tailIndices])].sort((a, b) => a - b);
-    contextFacts = finalIndices.map(i => allFacts[i]);
-
-    // All shortlisted facts are considered relevant — show every thread at full detail.
-    relevantFacts = contextFacts;
-  } else {
-    // Small project: send all facts; promote threads that match any question keyword.
-    contextFacts = allFacts;
-    const keywords = extractKeywords(question);
-    relevantFacts = keywords.length > 0
-      ? allFacts.filter(r => keywords.some(kw => r.fact.toLowerCase().includes(kw)))
-      : [];
+  // Include cached daily summary (if available) so Sonnet has broad project awareness
+  // even when the specific thread wasn't in the selected facts.
+  const cachedSummary = await getCachedSummary(env, company).catch(() => null);
+  let summaryContext = "";
+  if (cachedSummary?.json) {
+    const s = cachedSummary.json;
+    const parts = [];
+    if (s.executive_summary) parts.push(`Overview: ${s.executive_summary}`);
+    if (s.open_issues?.length) parts.push(`Open issues:\n${s.open_issues.map(i => `• ${i.issue} [${i.priority}] — ${i.action_required}`).join("\n")}`);
+    if (s.cost_items?.length) parts.push(`Cost items:\n${s.cost_items.map(c => `• ${c.description}: ${c.amount} (${c.status})`).join("\n")}`);
+    if (s.risks?.length) parts.push(`Risks:\n${s.risks.map(r => `• ${r.risk} [${r.severity}]`).join("\n")}`);
+    summaryContext = `\n\n=== Recent Activity Summary (generated ${cachedSummary.generatedAt || "recently"}) ===\n${parts.join("\n\n")}`;
   }
-
-  const context = buildContextBlock(label, contextFacts, relevantFacts, [], totalCount);
 
   const messages = [
     ...history,
@@ -131,27 +106,48 @@ export async function handleBotQuery(env, chatId, question, project, isClarifica
     },
   ];
 
-  const res = await claudeFetch(CLAUDE_API, {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: SONNET_MODEL,
-      max_tokens: 600,
-      system: `${QA_SYSTEM_PROMPT}\n\n${context}`,
-      messages,
-    }),
-  });
+  sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
 
-  if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error(`Claude Sonnet error: ${res.status} ${errBody}`);
+  // Progressive context reduction on 529 (overloaded): halve the fact budget each attempt
+  // so a smaller prompt succeeds when the full-size one hits capacity.
+  let data;
+  const budgets = [QA_MAX_SHORTLIST, Math.floor(QA_MAX_SHORTLIST / 2), Math.floor(QA_MAX_SHORTLIST / 4)];
+  for (let attempt = 0; attempt < budgets.length; attempt++) {
+    const contextFacts = selectRelevantFacts(allFacts, question, budgets[attempt]);
+    const context = buildContextBlock(label, contextFacts, contextFacts, [], totalCount, fullDateRange);
+
+    const res = await claudeFetch(CLAUDE_API, {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: SONNET_MODEL,
+        max_tokens: 600,
+        system: `${QA_SYSTEM_PROMPT}${summaryContext}\n\n${context}`,
+        messages,
+      }),
+    });
+
+    if (res.status === 529) {
+      if (attempt < budgets.length - 1) {
+        console.warn(`Claude 529 on Q&A (attempt ${attempt + 1}), retrying with ${budgets[attempt + 1]} facts...`);
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      return "The AI service is currently busy — please try again in a moment.";
+    }
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Claude Sonnet error: ${res.status} ${errBody}`);
+    }
+
+    data = await res.json();
+    break;
   }
-
-  const data = await res.json();
   const answer = data.content[0].text.trim();
 
   const newHistory = [
@@ -321,7 +317,7 @@ export async function handleSummary(env, chatId, project) {
   // Exact cache lookup first (fast path — covers groups linked to exact company keys).
   const cached = await getCachedSummary(env, company);
   if (cached?.json) {
-    const text = formatSummaryText(label, cached.json);
+    const text = formatSummaryText(label, cached.json, cached.generatedAt);
     await env.DAYA_KV.put(`tg:bot:draft:${chatId}`, JSON.stringify(cached.json),
       { expirationTtl: 2 * 60 * 60 });
     return { text, json: cached.json };
@@ -335,7 +331,7 @@ export async function handleSummary(env, chatId, project) {
     if (matchedCompany === company) continue; // already tried above
     const fuzzyCached = await getCachedSummary(env, matchedCompany);
     if (fuzzyCached?.json) {
-      const text = formatSummaryText(label, fuzzyCached.json);
+      const text = formatSummaryText(label, fuzzyCached.json, fuzzyCached.generatedAt);
       await env.DAYA_KV.put(`tg:bot:draft:${chatId}`, JSON.stringify(fuzzyCached.json),
         { expirationTtl: 2 * 60 * 60 });
       return { text, json: fuzzyCached.json };
@@ -396,76 +392,113 @@ export async function generateDailySummaries(env) {
   return { cached, skipped, failed };
 }
 
-// ── Report handler (two-step: Haiku shortlist → Sonnet narrative) ─────────────
+// ── Report context builder (thread-grouped, chronological, all facts in full) ──
+
+// Simpler than buildContextBlock — no condensed section, all selected facts are
+// relevant and shown in full detail. Threads sorted by earliest date so Sonnet
+// traces the issue from first mention to most recent.
+function buildReportContextBlock(topic, label, facts, totalCount) {
+  if (facts.length === 0) {
+    return `=== ${label} — Project Memory ===\nNo relevant facts found for topic: ${topic}`;
+  }
+
+  const threadMap = new Map();
+  for (const r of facts) {
+    const tid = r.threadId || `solo_${r.emailDate || r.createdAt}`;
+    if (!threadMap.has(tid)) threadMap.set(tid, { subject: r.subject, facts: [] });
+    threadMap.get(tid).facts.push(r);
+  }
+
+  for (const thread of threadMap.values()) {
+    thread.facts.sort((a, b) => (a.emailDate || "").localeCompare(b.emailDate || ""));
+  }
+
+  // Sort threads by earliest date — chronological issue evolution
+  const sortedThreads = [...threadMap.entries()].sort(([, a], [, b]) => {
+    const aDate = a.facts[0]?.emailDate || "";
+    const bDate = b.facts[0]?.emailDate || "";
+    return aDate.localeCompare(bDate);
+  });
+
+  const allDates = facts.map(r => r.emailDate?.slice(0, 10)).filter(Boolean).sort();
+  const dateRange = allDates.length > 0 ? `${allDates[0]} to ${allDates[allDates.length - 1]}` : null;
+
+  let block = `=== ${label} — Project Memory ===\n`;
+  block += `Topic: ${topic}\n`;
+  block += `${facts.length} relevant facts across ${sortedThreads.length} email thread${sortedThreads.length !== 1 ? "s" : ""}`;
+  if (totalCount && totalCount > facts.length) block += ` (selected from ${totalCount} total)`;
+  block += ".\n";
+  if (dateRange) block += `Date range: ${dateRange}.\n`;
+
+  for (const [, thread] of sortedThreads) {
+    block += formatThread(thread);
+  }
+
+  return block;
+}
+
+// ── Report handler (thread-based selection → Sonnet narrative) ────────────────
+
+const REPORT_SYSTEM_PROMPT = `You are a professional report writer for Daya Interior Design (Doha, Qatar) — a fit-out, interior design, and project management company.
+
+Write formal issue/delay reports suitable for clients, contract administrators, or legal use.
+
+Rules:
+- Base all content strictly on the provided facts. Do not invent or speculate.
+- Trace the issue chronologically — show what was originally decided, what changed, who was responsible, and the current position.
+- Use specific dates, sender names, and email subjects when citing evidence.
+- Use formal language appropriate for contract correspondence.
+- Currency in AED. Dates as "DD Mon YYYY".
+- The narrative should be detailed — trace every step of the issue with dates and attribution.
+- Recommendations must be actionable and specific, not generic advice.
+
+Return ONLY valid JSON with this exact structure:
+{
+  "executive_summary": "3-5 sentences summarising the issue and current status",
+  "background": "2-4 sentences of project context relevant to this issue",
+  "narrative": "Detailed chronological account (8-15 sentences) tracing the issue's full evolution with specific dates, senders, and decisions at each step",
+  "evidence": [{"date": "YYYY-MM-DD", "sender": "name or email", "subject": "email subject", "excerpt": "most relevant sentence from the email", "attribution": "Client/Supplier/Daya — brief explanation of this item's significance"}],
+  "timeline": [{"date": "YYYY-MM-DD", "event": "what happened", "significance": "why it matters"}],
+  "impact": "3-5 sentences on programme and cost impact, including any quantified delays or cost figures from the evidence",
+  "recommendations": ["specific actionable recommendation 1", "specific actionable recommendation 2"],
+  "conclusion": "3-5 sentences with a clear closing position"
+}
+
+No markdown fences, no explanation, no extra text. Return ONLY the JSON object.`;
 
 export async function handleReport(env, chatId, topic, project) {
   const { company, label } = project;
 
-  const facts = await getAllProjectFacts(env, company);
-  if (facts.length === 0) {
-    return {
-      text: `📋 No facts recorded yet for this project.`,
-      json: null,
-    };
+  const allFacts = await getAllProjectFacts(env, company);
+  if (allFacts.length === 0) {
+    return { text: `📋 No facts recorded yet for this project.`, json: null };
   }
 
-  // Step 1: Shortlist relevant facts via Claude Haiku
-  const factIndex = facts
-    .map((f, i) =>
-      `[${i}] [${(f.emailDate || "").slice(0, 10)}] [${(f.subject || "").slice(0, 50)}] ${(f.fact || "").slice(0, 120)}`
-    )
-    .join("\n");
+  // Select relevant facts using thread-based scoring (same as Q&A, broader budget)
+  const selected = selectRelevantFacts(allFacts, topic, REPORT_MAX_SHORTLIST);
 
-  const shortlistRes = await claudeFetch(CLAUDE_API, {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: HAIKU_MODEL,
-      max_tokens: 300,
-      messages: [{
-        role: "user",
-        content:
-          `From the project fact list below, identify ALL facts that serve as evidence for this issue.\n` +
-          `Topic: ${topic}\n\n` +
-          `Include facts showing: decisions made, specs changed, delays, approvals, costs, contradictions.\n\n` +
-          `Return ONLY JSON: { "relevant_indices": [list of integers] }\n\n` +
-          `FACT LIST:\n${factIndex}`,
-      }],
-    }),
-  });
-
-  if (!shortlistRes.ok) throw new Error(`Claude Haiku shortlist error: ${shortlistRes.status}`);
-
-  const shortlistData = await shortlistRes.json();
-  let indices = [];
-  try {
-    const match = shortlistData.content[0].text.trim().match(/\{[\s\S]*\}/);
-    indices = JSON.parse(match[0]).relevant_indices || [];
-  } catch {
-    indices = [];
-  }
-
-  const shortlisted = indices
-    .filter(i => Number.isInteger(i) && i >= 0 && i < facts.length)
-    .map(i => facts[i]);
-
-  if (shortlisted.length === 0) {
+  if (selected.length < 3) {
     return {
       text: `📋 I couldn't find relevant facts for "<b>${escHtml(topic)}</b>" in the project memory. Try a different search term.`,
       json: null,
     };
   }
 
-  // Step 2: Generate report narrative via Claude Sonnet
-  const evidenceBlock = shortlisted
-    .map(f =>
-      `FROM: ${f.sender}\nDATE: ${(f.emailDate || "").slice(0, 10)}\nSUBJECT: ${f.subject}\nFACT: ${f.fact}`
-    )
-    .join("\n\n---\n\n");
+  // Include cached daily summary for broader project awareness
+  const cachedSummary = await getCachedSummary(env, company).catch(() => null);
+  let summaryContext = "";
+  if (cachedSummary?.json) {
+    const s = cachedSummary.json;
+    const parts = [];
+    if (s.executive_summary) parts.push(`Project overview: ${s.executive_summary}`);
+    if (s.open_issues?.length) parts.push(`Open issues:\n${s.open_issues.map(i => `• ${i.issue} [${i.priority}]`).join("\n")}`);
+    if (s.risks?.length) parts.push(`Risks:\n${s.risks.map(r => `• ${r.risk} [${r.severity}]`).join("\n")}`);
+    summaryContext = `\n\n=== Project Context (generated ${cachedSummary.generatedAt || "recently"}) ===\n${parts.join("\n\n")}`;
+  }
+
+  const contextBlock = buildReportContextBlock(topic, label, selected, allFacts.length);
+
+  sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
 
   const narrativeRes = await claudeFetch(CLAUDE_API, {
     method: "POST",
@@ -476,35 +509,23 @@ export async function handleReport(env, chatId, topic, project) {
     },
     body: JSON.stringify({
       model: SONNET_MODEL,
-      max_tokens: 1400,
+      max_tokens: 3000,
+      system: `${REPORT_SYSTEM_PROMPT}${summaryContext}`,
       messages: [{
         role: "user",
-        content:
-          `You are a professional report writer for Daya Interior Design (Doha, Qatar).\n` +
-          `Topic: ${topic}\nProject: ${label}\n\n` +
-          `Based on the evidence below, write a formal issue/delay report.\n\n` +
-          `Return ONLY valid JSON:\n` +
-          `{\n` +
-          `  "executive_summary": "2-3 sentences",\n` +
-          `  "background": "1-2 sentences of context",\n` +
-          `  "narrative": "4-6 sentences tracing the issue chronologically with specific dates",\n` +
-          `  "evidence": [{"date": "YYYY-MM-DD", "sender": "email", "subject": "subject", "excerpt": "most relevant sentence", "attribution": "Client/Supplier/Daya — explanation"}],\n` +
-          `  "impact": "2-3 sentences on programme/cost impact",\n` +
-          `  "conclusion": "2-3 sentences"\n` +
-          `}\n\n` +
-          `Use formal language suitable for client or contract administrator.\n\n` +
-          `EVIDENCE:\n${evidenceBlock}`,
+        content: `Topic: ${topic}\nProject: ${label}\n\n${contextBlock}`,
       }],
     }),
   });
 
-  if (!narrativeRes.ok) throw new Error(`Claude Sonnet narrative error: ${narrativeRes.status}`);
+  if (!narrativeRes.ok) throw new Error(`Claude Sonnet report error: ${narrativeRes.status}`);
 
   const narrativeData = await narrativeRes.json();
   let json;
   try {
-    const match = narrativeData.content[0].text.trim().match(/\{[\s\S]*\}/);
-    json = JSON.parse(match ? match[0] : narrativeData.content[0].text);
+    const raw = narrativeData.content[0].text.trim();
+    const codeBlock = raw.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+    json = JSON.parse(codeBlock ? codeBlock[1] : (raw.match(/\{[\s\S]*\}/) || [raw])[0]);
   } catch {
     throw new Error("Claude returned invalid JSON for report");
   }
@@ -526,14 +547,14 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
     },
     body: JSON.stringify({
       model: SONNET_MODEL,
-      max_tokens: 1400,
+      max_tokens: 3000,
       messages: [{
         role: "user",
         content:
           `You wrote this issue report for project "${label}", topic "${topic}":\n` +
           `${JSON.stringify(originalJson, null, 2)}\n\n` +
           `Please revise it based on this feedback: ${feedback}\n\n` +
-          `Return ONLY the revised JSON with the same structure.`,
+          `Return ONLY the revised JSON with the same structure, including executive_summary, background, narrative, evidence, timeline, impact, recommendations, and conclusion fields.`,
       }],
     }),
   });
@@ -554,7 +575,7 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
-function formatSummaryText(label, json) {
+function formatSummaryText(label, json, generatedAt = null) {
   const parts = [`📊 <b>${escHtml(label)} — Project Briefing</b>\n`];
 
   if (json.executive_summary) {
@@ -603,6 +624,16 @@ function formatSummaryText(label, json) {
     parts.push("");
   }
 
+  if (generatedAt) {
+    const d = new Date(generatedAt);
+    const stamp = d.toLocaleString("en-GB", {
+      timeZone: "Asia/Qatar",
+      day: "2-digit", month: "short", year: "numeric",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    });
+    parts.push(`<i>Last generated: ${stamp} (Qatar time)</i>`);
+  }
+
   return parts.join("\n");
 }
 
@@ -632,9 +663,27 @@ function formatReportText(topic, label, json) {
     parts.push("");
   }
 
+  if (json.timeline?.length > 0) {
+    parts.push(`📅 <b>Timeline:</b>`);
+    for (const t of json.timeline) {
+      parts.push(`• ${escHtml(t.date || "")} — ${escHtml(t.event || "")}`);
+      if (t.significance) parts.push(`  <i>${escHtml(t.significance)}</i>`);
+    }
+    parts.push("");
+  }
+
   parts.push(`<b>Impact:</b>`);
   parts.push(escHtml(json.impact || ""));
   parts.push("");
+
+  if (json.recommendations?.length > 0) {
+    parts.push(`💡 <b>Recommendations:</b>`);
+    json.recommendations.forEach((r, i) => {
+      parts.push(`${i + 1}. ${escHtml(r)}`);
+    });
+    parts.push("");
+  }
+
   parts.push(`<b>Conclusion:</b>`);
   parts.push(escHtml(json.conclusion || ""));
   parts.push("");
@@ -651,49 +700,76 @@ function extractKeywords(question) {
   return words.filter(w => w.length > 2 && !STOP_WORDS.has(w));
 }
 
-// Ask Haiku to identify relevant fact indices for a Q&A question.
-// Mirrors the shortlist step used by handleReport but scoped to Q&A.
-async function shortlistQAFactsWithHaiku(env, question, facts) {
-  const factIndex = facts
-    .map((f, i) =>
-      `[${i}] [${(f.emailDate || "").slice(0, 10)}] [${(f.subject || "").slice(0, 50)}] ${(f.fact || "").slice(0, 120)}`
-    )
-    .join("\n");
+// Score and select facts by email thread.
+// Groups all facts into their source threads, scores each thread by keyword relevance
+// + recency, then fills the budget with complete threads in score order.
+// This keeps thread context intact (MOM 008's 6 facts arrive together, not split apart)
+// and handles temporal queries ("latest", "most recent") correctly via recency weighting.
+function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST) {
+  const keywords = extractKeywords(question);
+  const isTemporalQuery = /\b(latest|most recent|last|recent|newest|current)\b/i.test(question);
+  const now = Date.now();
 
-  const res = await claudeFetch(CLAUDE_API, {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: HAIKU_MODEL,
-      max_tokens: 400,
-      messages: [{
-        role: "user",
-        content:
-          `From the project fact list below, identify ALL facts that are relevant to answering this question.\n` +
-          `Question: ${question}\n\n` +
-          `Consider: direct mentions, related topics, context clues, and recent updates.\n` +
-          `Return ONLY JSON: { "relevant_indices": [list of integers] }\n\n` +
-          `FACT LIST:\n${factIndex}`,
-      }],
-    }),
-  });
-
-  if (!res.ok) throw new Error(`Claude Haiku Q&A shortlist error: ${res.status}`);
-
-  const data = await res.json();
-  try {
-    const match = data.content[0].text.trim().match(/\{[\s\S]*\}/);
-    return JSON.parse(match[0]).relevant_indices || [];
-  } catch {
-    return [];
+  // Group facts into threads, preserving insertion order within each thread
+  const threads = new Map();
+  for (const fact of allFacts) {
+    const tid = fact.threadId || `solo_${fact.emailDate || fact.createdAt}`;
+    if (!threads.has(tid)) threads.set(tid, []);
+    threads.get(tid).push(fact);
   }
+
+  // Sort facts within each thread chronologically
+  for (const facts of threads.values()) {
+    facts.sort((a, b) => (a.emailDate || "").localeCompare(b.emailDate || ""));
+  }
+
+  // Score each thread
+  const scoredThreads = [];
+  for (const [tid, facts] of threads.entries()) {
+    let kwScore = 0;
+    for (const fact of facts) {
+      const text = (fact.fact || "").toLowerCase();
+      const subj = (fact.subject || "").toLowerCase();
+      for (const kw of keywords) {
+        if (text.includes(kw)) kwScore += 2;
+        if (subj.includes(kw)) kwScore += 1;
+      }
+    }
+
+    const latestDate = new Date(facts[facts.length - 1]?.emailDate || 0).getTime();
+    const ageDays = (now - latestDate) / 86400000;
+    const recencyScore = Math.max(0, 3 * (1 - ageDays / 365));
+    const recencyWeight = isTemporalQuery ? 2.5 : 1;
+
+    scoredThreads.push({ tid, facts, score: kwScore + recencyScore * recencyWeight, kwScore });
+  }
+
+  // Sort threads by score descending; require at least one keyword hit to include
+  scoredThreads.sort((a, b) => b.score - a.score);
+
+  // Greedily fill budget with complete threads
+  const selected = [];
+  for (const thread of scoredThreads) {
+    if (thread.kwScore === 0) continue;
+    if (selected.length >= maxCount) break;
+    const remaining = maxCount - selected.length;
+    // Take all facts if they fit; otherwise take the most recent facts from the thread
+    const toAdd = thread.facts.length <= remaining
+      ? thread.facts
+      : thread.facts.slice(-remaining);
+    selected.push(...toAdd);
+  }
+
+  // Fallback: almost nothing keyword-matched → return most recent facts
+  if (selected.length < 5) {
+    return allFacts.slice(-maxCount);
+  }
+
+  // Return chronologically sorted so Sonnet sees a clear timeline
+  return selected.sort((a, b) => (a.emailDate || "").localeCompare(b.emailDate || ""));
 }
 
-function buildContextBlock(label, merged, relevant, recent, totalCount) {
+function buildContextBlock(label, merged, relevant, recent, totalCount, fullDateRange = null) {
   if (merged.length === 0) {
     return `=== ${label} — Project Memory ===\nNo facts on record yet.`;
   }
@@ -718,10 +794,10 @@ function buildContextBlock(label, merged, relevant, recent, totalCount) {
   const realTotal = totalCount ?? displayFacts;
   const totalThreads = threadMap.size;
 
-  // Compute date range so Claude can answer earliest/latest questions directly
-  // without having to search through hundreds of individual facts.
-  const dates = merged.map(r => r.emailDate?.slice(0, 10)).filter(Boolean).sort();
-  const dateRange = dates.length > 0 ? `${dates[0]} to ${dates[dates.length - 1]}` : null;
+  // Use full date range from all facts when available (large projects shortlist facts,
+  // so computing from merged alone would give a narrow recent window).
+  const _dates = merged.map(r => r.emailDate?.slice(0, 10)).filter(Boolean).sort();
+  const dateRange = fullDateRange ?? (_dates.length > 0 ? `${_dates[0]} to ${_dates[_dates.length - 1]}` : null);
 
   let block = `=== ${label} — Project Memory ===\n${realTotal} facts across ${totalThreads} email thread${totalThreads !== 1 ? "s" : ""}.\n`;
   if (dateRange) block += `Email date range: ${dateRange}.\n`;

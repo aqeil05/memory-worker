@@ -2,14 +2,13 @@
 // Extracts company name + key facts from email body and any PDF attachments.
 // Returns: { company: string, facts: string[] }
 
+import { getActiveProjects } from "./onedrive.js";
+
 const CLAUDE_API = "https://api.anthropic.com/v1/messages";
 const HAIKU_MODEL = "claude-haiku-4-5";
 
-const SYSTEM_PROMPT = `You extract key facts from business emails and documents for an interior fit-out company's project memory system.
-Company context: Daya Interior Design, Doha Qatar — fit-out, interior design, project management, carpentry.
-
-Extract:
-1. The PROJECT name this email relates to. Look for it in the subject line — it is usually the client or building name, often followed by a floor or unit reference (e.g. "Malomatia 19th floor", "Al Fardan Villa", "QU Student Housing", "B3-A5-37").
+const FACT_RULES = `Extract:
+1. The PROJECT name this email relates to.
    Rules:
    - Always prefer the CLIENT or BUILDING name over a bare floor/level reference. "Malomatia 19th floor" is correct; "14th floor" alone is NOT — pair it with the building name.
    - Never use a standalone floor or level descriptor (e.g. "14th floor", "level 3", "ground floor") as the full project name. If only a floor reference appears in the subject, search the email body or sender domain for the client/building name and combine them.
@@ -30,12 +29,53 @@ Return ONLY valid JSON, no markdown fences:
 If you cannot identify a project or extract meaningful facts, return:
 { "company": "", "facts": [] }`;
 
+function buildSystemPrompt(activeProjects) {
+  const header = `You extract key facts from business emails and documents for an interior fit-out company's project memory system.
+Company context: Daya Interior Design, Doha Qatar — fit-out, interior design, project management, carpentry.`;
+
+  if (!activeProjects || activeProjects.length === 0) {
+    return `${header}\n\n${FACT_RULES}`;
+  }
+
+  const projectList = activeProjects.map((p, i) => `${i + 1}. ${p}`).join("\n");
+  return `${header}
+
+ACTIVE PROJECTS — if this email clearly relates to one of these, use that exact name (as written below, already lowercase). If none clearly match, extract the best project/client name from the email content.
+${projectList}
+
+${FACT_RULES}`;
+}
+
 // ── Company name alias map ─────────────────────────────────────────────────────
 // Maps known variations → canonical project key stored in KV.
 // Add new aliases here whenever a project is found to be split across multiple keys.
 // Keys must be lowercase. Applied AFTER Claude extraction as a safety net.
 
 const COMPANY_ALIASES = {
+  // Nabina
+  "nabina ceramic":                   "nabina",
+  "nabina holding":                   "nabina",
+  "nabina interiors":                 "nabina",
+  "nabina interiors co":              "nabina",
+  "nabina interiors co / malomatia":  "nabina",
+  "nabina interiors malomatia":       "nabina",
+  "nabina interiors office":          "nabina",
+
+  // MCIT
+  "mcit 14th floor":                              "mcit",
+  "mcit 19 floor":                                "mcit",
+  "mcit 19th floor":                              "mcit",
+  "mcit operations centre":                       "mcit",
+  "mcit operation center":                        "mcit",
+  "mcit operation center at al brooq tower":      "mcit",
+  "mcit operation centre 14th floor al borooq tower": "mcit",
+  "mcit operations centre 14th floor brooq tower":"mcit",
+  "mcit water leakage 16th 15th 14th floors":     "mcit",
+
+  // Singapore Embassy
+  "singapore embassy fit-out work":               "singapore embassy",
+  "singapore embassy meeting room":               "singapore embassy",
+
   // Malomatia 19th floor variations
   "malomatia":           "malomatia 19th floor",
   "malomatia 19":        "malomatia 19th floor",
@@ -44,6 +84,42 @@ const COMPANY_ALIASES = {
   "malomatia qatar":     "malomatia 19th floor",
   "p18174":              "malomatia 19th floor",
   "14th floor":          "malomatia 19th floor",
+
+  // Villaggio Starlink kiosk
+  "villaggio kiosk":                      "villaggio starlink",
+  "villaggio kiosk - mall shop":          "villaggio starlink",
+  "villaggio kiosk - new fitout":         "villaggio starlink",
+  "villaggio kiosk starlink retail stand":"villaggio starlink",
+  "villaggio starlink kiosk":             "villaggio starlink",
+  "villaggio mall kiosk":                 "villaggio starlink",
+
+  // QSTP kiosk / web summit booth
+  "qstp booth re installation":                           "qstp kiosk",
+  "qstp booth re-installation":                           "qstp kiosk",
+  "qstp booth re-installation (web summit tree stand)":   "qstp kiosk",
+  "qstp booth re-installation rayyan":                    "qstp kiosk",
+  "qstp booth re-installation tech2":                     "qstp kiosk",
+  "qstp kiosk at web summit 2026":                        "qstp kiosk",
+  "qstp stand at qatar web summit":                       "qstp kiosk",
+  "qstp stand for qatar web summit":                      "qstp kiosk",
+  "qstp web summit booth and tree reinstallation":        "qstp kiosk",
+  "qstp web summit booth at qstp rayyan":                 "qstp kiosk",
+  "qstp web summit booth re-installation tech2":          "qstp kiosk",
+  "qstp web summit tree stand at qstp rayyan":            "qstp kiosk",
+  "qstp web summit":                                      "qstp kiosk",
+  "qstp booth":                                           "qstp kiosk",
+
+  // Daya workshop — B3 building complex (warehouse/workshop units)
+  "b3 a05 warehouse":    "daya workshop",
+  "b3 series buildings": "daya workshop",
+  "b3-a5-37":            "daya workshop",
+  "b3-a5-37,38":         "daya workshop",
+  "b3-a5-38":            "daya workshop",
+  "b3-a5-39":            "daya workshop",
+  "b3-a5-40":            "daya workshop",
+  "b5a538":              "daya workshop",
+  "b3 workshop":         "daya workshop",
+  "daya warehouse":      "daya workshop",
 };
 
 export function normalizeCompany(name) {
@@ -54,13 +130,48 @@ export function normalizeCompany(name) {
   return lower;
 }
 
+// ── Dynamic KV alias helpers ──────────────────────────────────────────────────
+// Stored as mem:alias:{lowercased_source} → "canonical name" (no TTL, permanent).
+// Used alongside the hardcoded COMPANY_ALIASES map — hardcoded = fast path,
+// KV = dynamic extension added via /bot alias or /bot merge.
+
+export async function resolveAlias(name, env) {
+  const afterHardcoded = normalizeCompany(name);
+  // If the hardcoded map already changed the name, trust it — skip KV read.
+  if (afterHardcoded !== (name || "").toLowerCase().trim()) return afterHardcoded;
+  const kvAlias = await env.DAYA_KV.get(`mem:alias:${afterHardcoded}`);
+  if (kvAlias) {
+    console.log(`resolveAlias (KV): "${afterHardcoded}" → "${kvAlias}"`);
+    return kvAlias;
+  }
+  return afterHardcoded;
+}
+
+export async function setAlias(source, target, env) {
+  const s = (source || "").toLowerCase().trim();
+  const t = (target || "").toLowerCase().trim();
+  if (!s || !t) throw new Error("setAlias: source and target must be non-empty");
+  await env.DAYA_KV.put(`mem:alias:${s}`, t);
+}
+
+export async function listAliases(env) {
+  const result = await env.DAYA_KV.list({ prefix: "mem:alias:" });
+  const aliases = [];
+  for (const key of result.keys) {
+    const source = key.name.slice("mem:alias:".length);
+    const target = await env.DAYA_KV.get(key.name);
+    aliases.push({ source, target });
+  }
+  return aliases;
+}
+
 // ── Shared Claude fetch helper — retries 429 and 5xx with Retry-After / backoff ─
 
 export async function claudeFetch(url, options) {
   let res;
   for (let attempt = 0; attempt < 3; attempt++) {
     res = await fetch(url, options);
-    const shouldRetry = res.status === 429 || res.status >= 500;
+    const shouldRetry = res.status === 429 || (res.status >= 500 && res.status !== 529);
     if (!shouldRetry) break;
     if (attempt === 2) break; // exhausted retries — fall through to caller
     const waitMs = res.status === 429
@@ -75,6 +186,10 @@ export async function claudeFetch(url, options) {
 // ── Main export ───────────────────────────────────────────────────────────────
 
 export async function extractEmailFacts(env, { from, subject, body, date, pdfs = [], docxTexts = [] }) {
+  const activeProjects = await getActiveProjects(env);
+  const systemPrompt = buildSystemPrompt(activeProjects);
+  const activeSet = new Set(activeProjects);
+
   // Build content array:
   //   1. PDFs as native document blocks (Claude reads them directly)
   //   2. Word docs as extracted text blocks
@@ -106,7 +221,7 @@ ${body.slice(0, 3000)}`,
   const payload = JSON.stringify({
     model: HAIKU_MODEL,
     max_tokens: 400,
-    system: SYSTEM_PROMPT,
+    system: systemPrompt,
     messages: [{ role: "user", content }],
   });
 
@@ -134,9 +249,13 @@ ${body.slice(0, 3000)}`,
   try {
     const parsed = JSON.parse(cleaned);
     const rawCompany = (parsed.company || "").toLowerCase().trim();
-    const company = normalizeCompany(rawCompany);
+    // If Claude matched an active project, use it directly — no alias resolution needed.
+    // Otherwise fall through to the existing alias/normalization pipeline.
+    const company = activeSet.has(rawCompany)
+      ? rawCompany
+      : await resolveAlias(rawCompany, env);
     if (company !== rawCompany) {
-      console.log(`normalizeCompany: "${rawCompany}" → "${company}"`);
+      console.log(`resolveAlias: "${rawCompany}" → "${company}"`);
     }
     return {
       company,

@@ -8,8 +8,10 @@
 import { handleEmailWebhook, backfillEmails, processEmail } from "./email-handler.js";
 import { handleTelegramUpdate } from "./telegram.js";
 import { registerSubscription, renewSubscriptions } from "./graph.js";
-import { setupWorkbook, exportToExcel, getAllCompanies, appendFacts } from "./onedrive.js";
+import { setupWorkbook, exportToExcel, getAllCompanies, appendFacts, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
 import { generateDailySummaries } from "./telegram-bot-query.js";
+import { setAlias } from "./memory.js";
+import { sendMessage } from "./notify.js";
 
 const INBOXES = [
   "peterkimani@wearedaya.com",
@@ -112,6 +114,56 @@ export default {
     if (method === "GET" && url.pathname === "/merge-company") {
       const deny = requireSecret(request, env); if (deny) return deny;
       return handleMergeCompany(url, env);
+    }
+
+    // GET /projects — list active project names (no auth)
+    if (method === "GET" && url.pathname === "/projects") {
+      const projects = await getActiveProjects(env);
+      return new Response(JSON.stringify({ projects }, null, 2), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // GET /projects/add?name=X — add a project to the active list
+    if (method === "GET" && url.pathname === "/projects/add") {
+      const deny = requireSecret(request, env); if (deny) return deny;
+      const name = (url.searchParams.get("name") || "").trim();
+      if (!name) {
+        return new Response(JSON.stringify({ ok: false, error: "?name= is required" }), {
+          status: 400, headers: { "Content-Type": "application/json" },
+        });
+      }
+      try {
+        const result = await addActiveProject(env, name);
+        return new Response(JSON.stringify({ ok: true, ...result }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // GET /projects/archive?name=X — remove a project from the active list (facts stay in KV)
+    if (method === "GET" && url.pathname === "/projects/archive") {
+      const deny = requireSecret(request, env); if (deny) return deny;
+      const name = (url.searchParams.get("name") || "").trim();
+      if (!name) {
+        return new Response(JSON.stringify({ ok: false, error: "?name= is required" }), {
+          status: 400, headers: { "Content-Type": "application/json" },
+        });
+      }
+      try {
+        const result = await archiveProject(env, name);
+        return new Response(JSON.stringify({ ok: true, ...result }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        });
+      }
     }
 
     // GET /companies — list all company keys in the database (useful for /link)
@@ -273,11 +325,22 @@ async function handleResetDb(env) {
 async function handleBackfill(request, env, ctx) {
   const url = new URL(request.url);
   const limit = parseInt(url.searchParams.get("limit") || "2000");
+  const chatId = url.searchParams.get("chatId") || null;
 
   // Run synchronously — avoids the 30s post-response waitUntil window limit.
   // Processes up to 15 emails per call; re-run until hasMore is false.
   try {
     const result = await backfillEmails(env, limit);
+
+    if (chatId) {
+      const tgMsg = result.processed === 0
+        ? `✅ Inbox up to date — ${result.skipped} emails already processed, nothing new.`
+        : result.hasMore
+          ? `⏳ Batch done: ${result.processed} new emails processed, ${result.factsStored} facts stored (${result.skipped} already done). More remain — run /bot backfill again.`
+          : `✅ Backfill complete: ${result.processed} new emails processed, ${result.factsStored} facts stored (${result.skipped} already done).`;
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, tgMsg).catch(() => {});
+    }
+
     return new Response(
       JSON.stringify({
         ok: true,
@@ -290,6 +353,9 @@ async function handleBackfill(request, env, ctx) {
     );
   } catch (err) {
     console.error(`backfillEmails crashed: ${err.stack || err.message}`);
+    if (chatId) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, `❌ Backfill failed: ${err.message}`).catch(() => {});
+    }
     return new Response(
       JSON.stringify({ ok: false, error: err.message }),
       { status: 500, headers: { "Content-Type": "application/json" } }
@@ -332,29 +398,20 @@ async function handleMergeCompany(url, env) {
     });
   }
 
-  // Read facts from the stale key
-  const fromFacts = await env.DAYA_KV.get(`mem:facts:${from}`, "json") || [];
-  if (fromFacts.length === 0) {
-    return new Response(JSON.stringify({ ok: true, moved: 0, message: `No facts found under "${from}" — nothing to merge.` }), {
+  try {
+    const result = await mergeCompany(env, from, into);
+    await setAlias(from, into, env);
+    const message = result.moved === 0
+      ? `No facts found under "${from}" — alias set, nothing to merge.`
+      : `Moved ${result.moved} facts from "${from}" → "${into}" and alias registered.`;
+    return new Response(JSON.stringify({ ok: true, ...result, message }), {
       headers: { "Content-Type": "application/json" },
     });
+  } catch (err) {
+    return new Response(JSON.stringify({ ok: false, error: err.message }), {
+      status: 500, headers: { "Content-Type": "application/json" },
+    });
   }
-
-  // Re-tag each fact with the canonical company name and append (dedup built-in)
-  const retagged = fromFacts.map(f => ({ ...f, company: into }));
-  await appendFacts(env, retagged);
-
-  // Delete the stale keys
-  await Promise.all([
-    env.DAYA_KV.delete(`mem:facts:${from}`),
-    env.DAYA_KV.delete(`mem:co:${from}`),
-    env.DAYA_KV.delete(`summary:cache:${from}`),
-  ]);
-
-  console.log(`merge-company: moved ${fromFacts.length} facts from "${from}" → "${into}"`);
-  return new Response(JSON.stringify({ ok: true, moved: fromFacts.length, from, into }), {
-    headers: { "Content-Type": "application/json" },
-  });
 }
 
 // ── GET /setup-db — create OneDrive Excel workbook ────────────────────────────

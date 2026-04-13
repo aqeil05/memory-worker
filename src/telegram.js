@@ -13,15 +13,15 @@
 //   - After Refine button → captures feedback text
 
 import { handleBotQuery, handleSummary, handleReport, regenerateReport } from "./telegram-bot-query.js";
-import { linkGroup, getGroupProject, uploadReport, matchingCompanies, getAllCompanies } from "./onedrive.js";
-import { normalizeCompany } from "./memory.js";
+import { linkGroup, getGroupProject, uploadReport, matchingCompanies, getAllCompanies, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
+import { normalizeCompany, setAlias, listAliases } from "./memory.js";
 import { buildSummaryDocx, buildReportDocx } from "./docx.js";
 import {
   getBotPending, setBotPending, deleteBotPending,
   getDraft, setDraft, deleteDraft,
   getRefinePending, setRefinePending, deleteRefinePending,
 } from "./dedup.js";
-import { sendMessage, sendLongMessage, sendWithButtons, answerCallback, escHtml } from "./notify.js";
+import { sendMessage, sendLongMessage, sendWithButtons, answerCallback, escHtml, sendChatAction } from "./notify.js";
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -58,7 +58,7 @@ export async function handleTelegramUpdate(request, env, ctx) {
   const text = msg.text.trim();
 
   ctx.waitUntil(
-    handleGroupMessage(env, chatId, text)
+    handleGroupMessage(env, ctx, chatId, text)
       .catch(err => console.error(`handleGroupMessage failed [${chatId}]: ${err.stack || err.message}`))
   );
   return new Response("OK");
@@ -66,7 +66,7 @@ export async function handleTelegramUpdate(request, env, ctx) {
 
 // ── Message dispatcher ────────────────────────────────────────────────────────
 
-async function handleGroupMessage(env, chatId, text) {
+async function handleGroupMessage(env, ctx, chatId, text) {
   try {
     if (text.startsWith("/link")) {
       await handleLink(env, chatId, text);
@@ -79,7 +79,7 @@ async function handleGroupMessage(env, chatId, text) {
     }
 
     if (text.startsWith("/bot") || text.startsWith("/bot@")) {
-      await handleBotCommand(env, chatId, text);
+      await handleBotCommand(env, ctx, chatId, text);
       return;
     }
 
@@ -100,6 +100,10 @@ async function handleGroupMessage(env, chatId, text) {
       await handleReportTopic(env, chatId, text, pending.project);
       return;
     }
+    if (pending?.type === "merge") {
+      await handleMergeStep(env, chatId, text, pending);
+      return;
+    }
 
     // Everything else: ignore silently
   } catch (err) {
@@ -109,7 +113,10 @@ async function handleGroupMessage(env, chatId, text) {
 
 // ── /bot command router ───────────────────────────────────────────────────────
 
-async function handleBotCommand(env, chatId, text) {
+async function handleBotCommand(env, ctx, chatId, text) {
+  // Immediate typing indicator — shows "Bot is typing..." before any slow operations.
+  sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+
   const question = text.replace(/\/bot(?:@\S+)?/, "").trim();
   const lowerQ = question.toLowerCase();
 
@@ -119,9 +126,127 @@ async function handleBotCommand(env, chatId, text) {
       "Examples:\n" +
       "• <code>/bot when is the site visit?</code>\n" +
       "• <code>/bot summary</code>\n" +
-      "• <code>/bot report</code>");
+      "• <code>/bot report</code>\n" +
+      "• <code>/bot projects</code>\n" +
+      "• <code>/bot addproject lux tower</code>\n" +
+      "• <code>/bot archiveproject lux tower</code>\n" +
+      "• <code>/bot companies</code>\n" +
+      "• <code>/bot alias old name → canonical name</code>\n" +
+      "• <code>/bot merge</code>");
     return;
   }
+
+  // ── DB management commands — no project link required ──────────────────────
+
+  // /bot companies — list all company keys with fact counts
+  if (lowerQ === "companies") {
+    const companies = await getAllCompanies(env);
+    if (companies.length === 0) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📂 No companies in the database yet. Run <code>/bot backfill</code> first.");
+      return;
+    }
+    const lines = [];
+    for (const co of companies.sort()) {
+      const facts = await env.DAYA_KV.get(`mem:facts:${co}`, "json") || [];
+      lines.push(`• <code>${escHtml(co)}</code> — ${facts.length} facts`);
+    }
+    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `<b>Companies in database (${companies.length}):</b>\n` + lines.join("\n"));
+    return;
+  }
+
+  // /bot alias list — show all dynamic KV aliases
+  if (lowerQ === "alias list") {
+    const aliases = await listAliases(env);
+    if (aliases.length === 0) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📋 No custom aliases set yet.\n\nUse <code>/bot alias source name → canonical name</code> to add one.");
+      return;
+    }
+    const lines = aliases.map(a => `• <code>${escHtml(a.source)}</code> → <code>${escHtml(a.target)}</code>`);
+    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `<b>Custom aliases (${aliases.length}):</b>\n` + lines.join("\n"));
+    return;
+  }
+
+  // /bot alias {source} → {target}  (also accepts ->)
+  const aliasMatch = question.match(/^alias\s+(.+?)\s*(?:→|->)\s*(.+)$/i);
+  if (aliasMatch) {
+    const source = aliasMatch[1].toLowerCase().trim();
+    const target = aliasMatch[2].toLowerCase().trim();
+    if (!source || !target) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "⚠️ Usage: <code>/bot alias source name → canonical name</code>");
+      return;
+    }
+    await setAlias(source, target, env);
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `✅ Alias set: <code>${escHtml(source)}</code> → <code>${escHtml(target)}</code>\n\n` +
+      `Future emails matching "<b>${escHtml(source)}</b>" will be routed to "<b>${escHtml(target)}</b>".`);
+    return;
+  }
+
+  // /bot projects — list active project names
+  if (lowerQ === "projects") {
+    const projects = await getActiveProjects(env);
+    if (projects.length === 0) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📂 No active projects configured yet.\n\nUse <code>/bot addproject project name</code> to add one.");
+      return;
+    }
+    const lines = [];
+    for (const p of projects) {
+      const facts = await env.DAYA_KV.get(`mem:facts:${p}`, "json") || [];
+      lines.push(`• <code>${escHtml(p)}</code> — ${facts.length} facts`);
+    }
+    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `<b>Active projects (${projects.length}):</b>\n` + lines.join("\n"));
+    return;
+  }
+
+  // /bot addproject {name} — add to active project list
+  const addProjectMatch = question.match(/^addproject\s+(.+)$/i);
+  if (addProjectMatch) {
+    const name = addProjectMatch[1].toLowerCase().trim();
+    const result = await addActiveProject(env, name);
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      result.added
+        ? `✅ Added <code>${escHtml(name)}</code> to the active project list.\n\nFuture emails will be matched against it.`
+        : `ℹ️ <code>${escHtml(name)}</code> is already in the active project list.`);
+    return;
+  }
+
+  // /bot archiveproject {name} — remove from active project list (facts stay in KV)
+  const archiveProjectMatch = question.match(/^archiveproject\s+(.+)$/i);
+  if (archiveProjectMatch) {
+    const name = archiveProjectMatch[1].toLowerCase().trim();
+    const result = await archiveProject(env, name);
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      result.removed
+        ? `✅ <code>${escHtml(name)}</code> removed from active projects.\n\nExisting facts are preserved — new emails will no longer route here.`
+        : `⚠️ <code>${escHtml(name)}</code> was not found in the active project list.`);
+    return;
+  }
+
+  // /bot merge — guided two-step merge flow
+  if (lowerQ === "merge") {
+    const companies = await getAllCompanies(env);
+    if (companies.length === 0) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📂 No companies in the database yet.");
+      return;
+    }
+    const list = companies.sort().map(c => `• <code>${escHtml(c)}</code>`).join("\n");
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `<b>Merge companies — Step 1 of 2</b>\n\nWhich company should be merged FROM (the duplicate to remove)?\n\n` +
+      `<b>Available companies:</b>\n${list}\n\n` +
+      `Reply with the exact company name to merge FROM.`);
+    await setBotPending(env.DAYA_KV, chatId, { type: "merge", step: 1 });
+    return;
+  }
+
+  // ── Project-required commands ───────────────────────────────────────────────
 
   const project = await getGroupProject(env.DAYA_KV, chatId);
   if (!project) {
@@ -151,8 +276,11 @@ async function handleBotCommand(env, chatId, text) {
       "⏳ Backfill started — processing up to 150 emails per inbox across 2 inboxes.\n\n" +
       "Already-processed emails are skipped. Run again to continue if needed."
     );
-    // Fire-and-forget: POST to our own /backfill endpoint so it runs in its own context
-    fetch(`${env.MEMORY_WORKER_URL}/backfill`).catch(() => {});
+    // Dispatch to our own /backfill endpoint so it runs in its own context.
+    // ctx.waitUntil ensures the fetch is sent before this worker context terminates.
+    ctx.waitUntil(
+      fetch(`${env.MEMORY_WORKER_URL}/backfill?chatId=${encodeURIComponent(chatId)}`).catch(() => {})
+    );
     return;
   }
 
@@ -193,6 +321,52 @@ async function handleReportTopic(env, chatId, topic, project) {
       [[
         { text: "📥 Export as Word", callback_data: "export_report" },
         { text: "✏️ Refine", callback_data: "refine_report" },
+      ]]
+    );
+  }
+}
+
+// ── Guided merge flow ─────────────────────────────────────────────────────────
+
+async function handleMergeStep(env, chatId, text, pending) {
+  const userInput = text.trim().toLowerCase();
+
+  if (pending.step === 1) {
+    const companies = await getAllCompanies(env);
+    if (!companies.includes(userInput)) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        `⚠️ Company "<b>${escHtml(userInput)}</b>" not found.\n\n` +
+        `Reply with an exact name, or run <code>/bot companies</code> to see all options.`);
+      await setBotPending(env.DAYA_KV, chatId, { type: "merge", step: 1 });
+      return;
+    }
+    await setBotPending(env.DAYA_KV, chatId, { type: "merge", step: 2, from: userInput });
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `<b>Merge companies — Step 2 of 2</b>\n\n` +
+      `Merge <code>${escHtml(userInput)}</code> INTO which canonical company?\n\n` +
+      `Reply with the canonical company name (the one to keep).`);
+    return;
+  }
+
+  if (pending.step === 2) {
+    const { from } = pending;
+    const into = userInput;
+    if (from === into) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "⚠️ FROM and INTO cannot be the same. Reply with a different canonical name.");
+      await setBotPending(env.DAYA_KV, chatId, { type: "merge", step: 2, from });
+      return;
+    }
+    await deleteBotPending(env.DAYA_KV, chatId);
+    await setDraft(env.DAYA_KV, chatId, { type: "merge_confirm", from, into });
+    await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `<b>Confirm merge:</b>\n\n` +
+      `Move all facts from <code>${escHtml(from)}</code> → <code>${escHtml(into)}</code>\n` +
+      `An alias will also be added so future emails auto-route correctly.\n\n` +
+      `⚠️ This cannot be undone (except by merging back).`,
+      [[
+        { text: "✅ Yes, merge", callback_data: "merge_confirm" },
+        { text: "❌ Cancel", callback_data: "merge_cancel" },
       ]]
     );
   }
@@ -258,6 +432,40 @@ async function handleCallbackQuery(env, chatId, data, callbackQueryId) {
         "✏️ <b>What should be added or changed?</b>\n\n" +
         "Describe the changes, e.g. \"emphasise the cost impact\" or \"add more detail about the delay timeline\"."
       );
+      return;
+    }
+
+    if (data === "merge_confirm") {
+      const draft = await getDraft(env.DAYA_KV, chatId);
+      if (!draft || draft.type !== "merge_confirm") {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ Merge session expired. Run <code>/bot merge</code> again.");
+        return;
+      }
+      const { from, into } = draft;
+      await deleteDraft(env.DAYA_KV, chatId);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        `⏳ Merging <code>${escHtml(from)}</code> → <code>${escHtml(into)}</code>...`);
+      try {
+        const result = await mergeCompany(env, from, into);
+        await setAlias(from, into, env);
+        const movedMsg = result.moved === 0
+          ? `No facts were found under "<b>${escHtml(from)}</b>" (already empty).`
+          : `${result.moved} facts moved to "<b>${escHtml(into)}</b>".`;
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          `✅ <b>Merge complete.</b>\n\n${movedMsg}\n` +
+          `Alias added: future emails matching "<b>${escHtml(from)}</b>" will route to "<b>${escHtml(into)}</b>".`);
+      } catch (mergeErr) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          `❌ Merge failed: ${escHtml(mergeErr.message)}`);
+      }
+      return;
+    }
+
+    if (data === "merge_cancel") {
+      const draft = await getDraft(env.DAYA_KV, chatId);
+      if (draft?.type === "merge_confirm") await deleteDraft(env.DAYA_KV, chatId);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "❌ Merge cancelled.");
       return;
     }
   } catch (err) {

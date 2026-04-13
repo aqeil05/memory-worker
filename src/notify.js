@@ -87,6 +87,15 @@ export async function sendWithButtons(botToken, chatId, text, buttons) {
   return json;
 }
 
+// Show "Bot is typing..." indicator — lasts ~5 seconds, fire-and-forget
+export async function sendChatAction(botToken, chatId, action = "typing") {
+  await fetch(`https://api.telegram.org/bot${botToken}/sendChatAction`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, action }),
+  });
+}
+
 // Acknowledge a callback_query (required within 10s of receiving it)
 export async function answerCallback(botToken, callbackQueryId, text = "") {
   const res = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
