@@ -94,17 +94,18 @@ export async function processEmail(env, userEmail, messageId) {
     return;
   }
 
-  // Build fact rows
+  // Build fact rows — facts are now {text, tags} objects from extractEmailFacts
   const sourceTag = [pdfs.length > 0 && "pdf", docxTexts.length > 0 && "docx"].filter(Boolean);
   const source = sourceTag.length > 0 ? `email+${sourceTag.join("+")}` : "email";
   const createdAt = new Date().toISOString();
-  const factRows = facts.map(fact => ({
+  const factRows = facts.map(factObj => ({
     company,
-    threadId: msg.conversationId,
+    threadId: msg.conversationId || msg.id,
     subject: msg.subject,
     sender: msg.from,
     emailDate: msg.receivedAt,
-    fact,
+    fact: factObj.text,
+    tags: factObj.tags || [],
     source,
     createdAt,
   }));
@@ -280,13 +281,14 @@ async function fetchAndExtractFacts(env, inbox, msgMeta, maxAttachmentBytes = 4 
     const sourceTag = [pdfs.length > 0 && "pdf", docxTexts.length > 0 && "docx"].filter(Boolean);
     const source = sourceTag.length > 0 ? `email+${sourceTag.join("+")}` : "email";
     const createdAt = new Date().toISOString();
-    const rows = facts.map(fact => ({
+    const rows = facts.map(factObj => ({
       company,
-      threadId: msg.conversationId,
+      threadId: msg.conversationId || msg.id,
       subject: msg.subject,
       sender: msg.from,
       emailDate: msg.receivedAt,
-      fact,
+      fact: factObj.text,
+      tags: factObj.tags || [],
       source,
       createdAt,
     }));

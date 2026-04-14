@@ -209,10 +209,11 @@ export default {
         console.error(`generateDailySummaries crashed: ${err.stack || err.message}`);
       }
     } else {
-      ctx.waitUntil(
-        renewSubscriptions(env)
-          .catch(err => console.error(`renewSubscriptions crashed: ${err.stack || err.message}`))
-      );
+      try {
+        await renewSubscriptions(env);
+      } catch (err) {
+        console.error(`renewSubscriptions crashed: ${err.stack || err.message}`);
+      }
     }
   },
 };
@@ -324,7 +325,9 @@ async function handleResetDb(env) {
 
 async function handleBackfill(request, env, ctx) {
   const url = new URL(request.url);
-  const limit = parseInt(url.searchParams.get("limit") || "2000");
+  const rawLimit = url.searchParams.get("limit");
+  const limit = rawLimit ? parseInt(rawLimit, 10) : 2000;
+  if (isNaN(limit) || limit <= 0) return new Response(JSON.stringify({ error: "Invalid limit parameter" }), { status: 400, headers: { "Content-Type": "application/json" } });
   const chatId = url.searchParams.get("chatId") || null;
 
   // Run synchronously — avoids the 30s post-response waitUntil window limit.

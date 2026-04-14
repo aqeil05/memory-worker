@@ -67,6 +67,7 @@ export async function appendFacts(env, factRows) {
       sender: f.sender || "",
       emailDate: f.emailDate || "",
       fact: f.fact || "",
+      tags: Array.isArray(f.tags) ? f.tags : [],
       source: f.source || "email",
       createdAt: f.createdAt || new Date().toISOString(),
     });
@@ -116,11 +117,15 @@ export async function mergeCompany(env, from, into) {
   const retagged = fromFacts.map(f => ({ ...f, company: into }));
   await appendFacts(env, retagged);
 
-  await Promise.all([
+  const deleteResults = await Promise.allSettled([
     env.DAYA_KV.delete(`mem:facts:${from}`),
     env.DAYA_KV.delete(`mem:co:${from}`),
     env.DAYA_KV.delete(`summary:cache:${from}`),
   ]);
+  const failed = deleteResults.filter(r => r.status === "rejected");
+  if (failed.length > 0) {
+    console.error(`mergeCompany: ${failed.length} KV delete(s) failed for "${from}":`, failed.map(r => r.reason?.message));
+  }
 
   console.log(`mergeCompany: moved ${fromFacts.length} facts from "${from}" → "${into}"`);
   return { moved: fromFacts.length, from, into };

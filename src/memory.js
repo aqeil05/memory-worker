@@ -1,11 +1,12 @@
 // ─── Claude Haiku — Email Fact Extraction ────────────────────────────────────
 // Extracts company name + key facts from email body and any PDF attachments.
-// Returns: { company: string, facts: string[] }
+// Returns: { company: string, facts: { text: string, tags: string[] }[] }
+// tags — one or more of: cost, timeline, decision, contact, risk, material, approval
 
 import { getActiveProjects } from "./onedrive.js";
 
 const CLAUDE_API = "https://api.anthropic.com/v1/messages";
-const HAIKU_MODEL = "claude-haiku-4-5";
+const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
 const FACT_RULES = `Extract:
 1. The PROJECT name this email relates to.
@@ -23,8 +24,12 @@ Each fact = one concise sentence. Include who said or decided it where relevant.
 Return ONLY valid JSON, no markdown fences:
 {
   "company": "project name in lowercase",
-  "facts": ["fact one.", "fact two.", "fact three."]
+  "facts": [
+    {"text": "fact one sentence.", "tags": ["cost"]},
+    {"text": "fact two sentence.", "tags": ["timeline", "decision"]}
+  ]
 }
+Tag each fact with 1-2 of: cost, timeline, decision, contact, risk, material, approval.
 
 If you cannot identify a project or extract meaningful facts, return:
 { "company": "", "facts": [] }`;
@@ -170,8 +175,17 @@ export async function listAliases(env) {
 export async function claudeFetch(url, options) {
   let res;
   for (let attempt = 0; attempt < 3; attempt++) {
-    res = await fetch(url, options);
-    const shouldRetry = res.status === 429 || (res.status >= 500 && res.status !== 529);
+    try {
+      res = await fetch(url, options);
+    } catch (networkErr) {
+      // Network failure (DNS, timeout, connection refused) — treat as retryable
+      console.warn(`Claude network error (attempt ${attempt + 1}/3): ${networkErr.message}`);
+      if (attempt === 2) throw networkErr;
+      await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
+      continue;
+    }
+    // 429 = rate limited; 5xx (including 529 = overloaded) = server error — all retryable
+    const shouldRetry = res.status === 429 || res.status >= 500;
     if (!shouldRetry) break;
     if (attempt === 2) break; // exhausted retries — fall through to caller
     const waitMs = res.status === 429
@@ -210,17 +224,22 @@ export async function extractEmailFacts(env, { from, subject, body, date, pdfs =
     })),
     {
       type: "text",
-      text: `FROM: ${from}
+      text: (() => {
+        const MAX_BODY = 3000;
+        const truncated = body.length > MAX_BODY;
+        if (truncated) console.warn(`Email body truncated: ${body.length} chars → ${MAX_BODY} | Subject: ${subject}`);
+        return `FROM: ${from}
 DATE: ${date}
 SUBJECT: ${subject}
-
-${body.slice(0, 3000)}`,
+${truncated ? "[NOTE: Email body was truncated due to length — extract facts from the visible portion only]\n" : ""}
+${body.slice(0, MAX_BODY)}`;
+      })(),
     },
   ];
 
   const payload = JSON.stringify({
     model: HAIKU_MODEL,
-    max_tokens: 400,
+    max_tokens: 600,
     system: systemPrompt,
     messages: [{ role: "user", content }],
   });
@@ -259,7 +278,15 @@ ${body.slice(0, 3000)}`,
     }
     return {
       company,
-      facts: Array.isArray(parsed.facts) ? parsed.facts.filter(f => typeof f === "string" && f.trim()) : [],
+      // Accept both old string format and new {text, tags} object format for graceful migration.
+      // New emails produce objects; any legacy strings (e.g. from partial rollouts) are normalised here.
+      facts: Array.isArray(parsed.facts)
+        ? parsed.facts
+            .map(f => typeof f === "string"
+              ? { text: f.trim(), tags: [] }
+              : { text: (f.text || "").trim(), tags: Array.isArray(f.tags) ? f.tags : [] })
+            .filter(f => f.text)
+        : [],
     };
   } catch {
     console.warn(`extractEmailFacts JSON parse failed. Raw: ${raw}`);

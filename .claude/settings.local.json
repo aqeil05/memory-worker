@@ -23,7 +23,13 @@
       "Bash(python3 -m json.tool)",
       "Bash(mkdir -p ~/.traycer/yolo_artifacts)",
       "Read(//Users/aqeil/.traycer/yolo_artifacts/**)",
-      "Bash(chmod +x \"/Users/aqeil/development/memory worker/merge.sh\")"
+      "Bash(chmod +x \"/Users/aqeil/development/memory worker/merge.sh\")",
+      "Read(//opt/homebrew/lib/node_modules/@openai/codex/**)",
+      "Read(//usr/local/lib/node_modules/@openai/codex/**)",
+      "Bash(sudo npm:*)",
+      "Bash(npm list:*)",
+      "Bash(rm -f /Users/aqeil/.npm/_cacache/content-v2/sha512/49/81)",
+      "Bash(npm install:*)"
     ]
   }
 }

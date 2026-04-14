@@ -2,17 +2,21 @@
 // Handles updates from the memory bot (@DayaProjectBot) in group/supergroup chats.
 //
 // Commands:
-//   /link {project name} — link this group to a project (admin runs once)
-//   /bot {question}      — Q&A against project memory
-//   /bot summary         — generate project briefing → [📥 Export as Word]
-//   /bot report          — prompt for topic → generate report → [📥 Export] [✏️ Refine]
+//   /link {project name} — link group to a project; auto-pins the query menu
+//   /bot                 — show 4-button query menu [❓ Q&A][📋 Summary][📅 Timeline][📊 Report]
+//   /bot pin             — re-send and pin the query menu
 //
-// Follow-ups (no /bot prefix needed):
-//   - After clarification question from bot → continues Q&A thread
-//   - After /bot report → captures topic
-//   - After Refine button → captures feedback text
+// Button flows (tap → bot prompts → user types → bot responds):
+//   ❓ Q&A       → "Ask your question:"         → answer
+//   📋 Summary   → generates immediately         → [📥 Export as Word]
+//   📅 Timeline  → "What item should I trace?"  → timeline
+//   📊 Report    → "What should the report cover?" → report → [📥 Export] [✏️ Refine]
+//
+// Admin commands (still type directly):
+//   /bot companies · /bot merge · /bot backfill · /bot projects
+//   /bot addproject · /bot archiveproject · /bot alias · /bot alias list
 
-import { handleBotQuery, handleSummary, handleReport, regenerateReport } from "./telegram-bot-query.js";
+import { handleBotQuery, handleSummary, handleReport, regenerateReport, handleTimeline } from "./telegram-bot-query.js";
 import { linkGroup, getGroupProject, uploadReport, matchingCompanies, getAllCompanies, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
 import { normalizeCompany, setAlias, listAliases } from "./memory.js";
 import { buildSummaryDocx, buildReportDocx } from "./docx.js";
@@ -20,8 +24,10 @@ import {
   getBotPending, setBotPending, deleteBotPending,
   getDraft, setDraft, deleteDraft,
   getRefinePending, setRefinePending, deleteRefinePending,
+  getActiveMode, setActiveMode, deleteActiveMode,
+  isRateLimited, incrementRateLimit,
 } from "./dedup.js";
-import { sendMessage, sendLongMessage, sendWithButtons, answerCallback, escHtml, sendChatAction } from "./notify.js";
+import { sendMessage, sendLongMessage, sendWithButtons, answerCallback, escHtml, sendChatAction, pinMessage } from "./notify.js";
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -40,7 +46,7 @@ export async function handleTelegramUpdate(request, env, ctx) {
     const data = cq.data || "";
     if (chatId && data) {
       ctx.waitUntil(
-        handleCallbackQuery(env, chatId, data, cq.id)
+        handleCallbackQuery(env, ctx, chatId, data, cq.id)
           .catch(err => console.error(`handleCallbackQuery failed [${chatId}]: ${err.stack || err.message}`))
       );
     }
@@ -68,12 +74,7 @@ export async function handleTelegramUpdate(request, env, ctx) {
 
 async function handleGroupMessage(env, ctx, chatId, text) {
   try {
-    if (text.startsWith("/link")) {
-      await handleLink(env, chatId, text);
-      return;
-    }
-
-    if (text.startsWith("/start")) {
+    if (text.startsWith("/link") || text.startsWith("/start")) {
       await handleLink(env, chatId, text);
       return;
     }
@@ -83,14 +84,21 @@ async function handleGroupMessage(env, ctx, chatId, text) {
       return;
     }
 
-    // Refine-pending: waiting for feedback text after Refine button tap
+    // Refine-pending (Refine button tap) takes priority over active mode
     const refinePending = await getRefinePending(env.DAYA_KV, chatId);
     if (refinePending) {
       await handleRefineText(env, chatId, text, refinePending);
       return;
     }
 
-    // Bot-pending: waiting for clarification reply or report topic
+    // Active mode: all plain messages handled by the current mode until /bot resets
+    const modeState = await getActiveMode(env.DAYA_KV, chatId);
+    if (modeState) {
+      await handleActiveMode(env, chatId, text, modeState);
+      return;
+    }
+
+    // Legacy one-shot pending states (clarification from Q&A, guided merge)
     const pending = await getBotPending(env.DAYA_KV, chatId);
     if (pending?.type === "clarification") {
       await handleClarification(env, chatId, text, pending);
@@ -100,8 +108,40 @@ async function handleGroupMessage(env, ctx, chatId, text) {
       await handleReportTopic(env, chatId, text, pending.project);
       return;
     }
+    if (pending?.type === "timeline") {
+      await handleTimelineTopic(env, chatId, text, pending.project);
+      return;
+    }
     if (pending?.type === "merge") {
       await handleMergeStep(env, chatId, text, pending);
+      return;
+    }
+
+    if (pending?.type === "proj_add") {
+      await deleteBotPending(env.DAYA_KV, chatId);
+      const name = text.trim().toLowerCase();
+      const result = await addActiveProject(env, name);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        result.added
+          ? `✅ Added <code>${escHtml(name)}</code> to active projects.\n\nFuture emails will be matched against it.`
+          : `ℹ️ <code>${escHtml(name)}</code> is already in the active project list.`);
+      return;
+    }
+
+    if (pending?.type === "alias_add") {
+      await deleteBotPending(env.DAYA_KV, chatId);
+      const m = text.match(/^(.+?)\s*(?:→|->)\s*(.+)$/);
+      if (!m) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ Format not recognised. Use: <code>source → canonical</code>\n\nTap <b>🔗 Aliases → ➕ Add alias</b> to try again.");
+        return;
+      }
+      const source = m[1].toLowerCase().trim();
+      const target = m[2].toLowerCase().trim();
+      await setAlias(source, target, env);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        `✅ Alias set: <code>${escHtml(source)}</code> → <code>${escHtml(target)}</code>\n\n` +
+        `Future emails matching "<b>${escHtml(source)}</b>" will route to "<b>${escHtml(target)}</b>".`);
       return;
     }
 
@@ -121,18 +161,9 @@ async function handleBotCommand(env, ctx, chatId, text) {
   const lowerQ = question.toLowerCase();
 
   if (!question) {
-    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-      "💬 Please include your question after <code>/bot</code>\n" +
-      "Examples:\n" +
-      "• <code>/bot when is the site visit?</code>\n" +
-      "• <code>/bot summary</code>\n" +
-      "• <code>/bot report</code>\n" +
-      "• <code>/bot projects</code>\n" +
-      "• <code>/bot addproject lux tower</code>\n" +
-      "• <code>/bot archiveproject lux tower</code>\n" +
-      "• <code>/bot companies</code>\n" +
-      "• <code>/bot alias old name → canonical name</code>\n" +
-      "• <code>/bot merge</code>");
+    await deleteActiveMode(env.DAYA_KV, chatId);
+    const project = await getGroupProject(env.DAYA_KV, chatId);
+    await sendQueryMenu(env, chatId, project?.label ?? null);
     return;
   }
 
@@ -246,6 +277,24 @@ async function handleBotCommand(env, ctx, chatId, text) {
     return;
   }
 
+  // /bot admin — show admin action menu
+  if (lowerQ === "admin") {
+    await sendAdminMenu(env, chatId);
+    return;
+  }
+
+  // /bot pin — (re)send and pin the query menu
+  if (lowerQ === "pin") {
+    const proj = await getGroupProject(env.DAYA_KV, chatId);
+    const menuMsgId = await sendQueryMenu(env, chatId, proj?.label ?? null);
+    if (menuMsgId) {
+      await pinMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, menuMsgId);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📌 Menu pinned. If it didn't appear at the top, make sure the bot is a group admin with <b>Pin Messages</b> permission.");
+    }
+    return;
+  }
+
   // ── Project-required commands ───────────────────────────────────────────────
 
   const project = await getGroupProject(env.DAYA_KV, chatId);
@@ -254,6 +303,33 @@ async function handleBotCommand(env, ctx, chatId, text) {
       "⚠️ This group isn't linked to a project yet. Use the setup link from the Closed Won flow.");
     return;
   }
+
+  // /bot timeline [topic] — trace lifecycle of one item (timber door, marble flooring, etc.)
+  if (lowerQ === "timeline" || lowerQ.startsWith("timeline ")) {
+    const topic = lowerQ.startsWith("timeline ") ? question.slice("timeline ".length).trim() : "";
+    if (!topic) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📅 <b>What item should I trace?</b>\n\n" +
+        "Reply with the topic, e.g.:\n" +
+        "• <i>timber door</i>\n" +
+        "• <i>marble flooring</i>\n" +
+        "• <i>CEO office glass partition</i>"
+      );
+      await setBotPending(env.DAYA_KV, chatId, { type: "timeline", project });
+      return;
+    }
+    await handleTimelineTopic(env, chatId, topic, project);
+    return;
+  }
+
+  // Rate-limit all Claude-powered /bot commands (soft cap: 20 per chat per hour).
+  // Admin commands above (/bot companies, /bot merge, etc.) are exempt — they don't call Claude.
+  if (await isRateLimited(env.DAYA_KV, chatId)) {
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      "⏸ Slow down — this group has sent 20 AI requests in the past hour. Try again soon.");
+    return;
+  }
+  await incrementRateLimit(env.DAYA_KV, chatId);
 
   // /bot summary — full project briefing
   if (lowerQ === "summary") {
@@ -300,6 +376,26 @@ async function handleBotCommand(env, ctx, chatId, text) {
   // Regular Q&A
   const answer = await handleBotQuery(env, chatId, question, project, false);
   await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, escHtml(answer));
+}
+
+// ── Timeline topic received (follow-up after /bot timeline or clarification) ──
+
+async function handleTimelineTopic(env, chatId, topic, project) {
+  await deleteBotPending(env.DAYA_KV, chatId);
+
+  sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+
+  const { text, clarify } = await handleTimeline(env, project, topic);
+
+  if (clarify) {
+    // Claude needs clarification — show the question and re-arm pending so next
+    // message retries handleTimeline with the user's refined topic
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, escHtml(text));
+    await setBotPending(env.DAYA_KV, chatId, { type: "timeline", project });
+    return;
+  }
+
+  await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, text);
 }
 
 // ── Report topic received (follow-up after /bot report) ───────────────────────
@@ -374,7 +470,7 @@ async function handleMergeStep(env, chatId, text, pending) {
 
 // ── Inline button handler ─────────────────────────────────────────────────────
 
-async function handleCallbackQuery(env, chatId, data, callbackQueryId) {
+async function handleCallbackQuery(env, ctx, chatId, data, callbackQueryId) {
   try {
     await answerCallback(env.TELEGRAM_MEMORY_BOT_TOKEN, callbackQueryId);
 
@@ -468,6 +564,286 @@ async function handleCallbackQuery(env, chatId, data, callbackQueryId) {
       await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "❌ Merge cancelled.");
       return;
     }
+
+    if (data === "mode:summary") {
+      const project = await getGroupProject(env.DAYA_KV, chatId);
+      if (!project) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ This group isn't linked to a project yet. Use <code>/link Project Name</code> first.");
+        return;
+      }
+      if (await isRateLimited(env.DAYA_KV, chatId)) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⏸ Slow down — this group has sent 20 AI requests in the past hour. Try again soon.");
+        return;
+      }
+      await incrementRateLimit(env.DAYA_KV, chatId);
+      sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+      const { text: summaryText, json } = await handleSummary(env, chatId, project);
+      await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, summaryText);
+      if (json) {
+        await setDraft(env.DAYA_KV, chatId, { type: "summary", project, json });
+        await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "Export this briefing as a Word document?",
+          [[{ text: "📥 Export as Word", callback_data: "export_summary" }]]);
+      }
+      // Summary is one-shot — show the menu again for the next action
+      await sendQueryMenu(env, chatId, project.label);
+      return;
+    }
+
+    if (data === "mode:qa") {
+      const project = await getGroupProject(env.DAYA_KV, chatId);
+      if (!project) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ This group isn't linked to a project yet. Use <code>/link Project Name</code> first.");
+        return;
+      }
+      await setActiveMode(env.DAYA_KV, chatId, { mode: "qa", project });
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "❓ <b>Q&A mode active.</b>\n\nAsk anything about this project — just type freely.\n<i>Type <code>/bot</code> to switch modes.</i>");
+      return;
+    }
+
+    if (data === "mode:timeline") {
+      const project = await getGroupProject(env.DAYA_KV, chatId);
+      if (!project) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ This group isn't linked to a project yet. Use <code>/link Project Name</code> first.");
+        return;
+      }
+      await setActiveMode(env.DAYA_KV, chatId, { mode: "timeline", project });
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📅 <b>Timeline mode active.</b>\n\nWhat item should I trace? e.g.:\n• <i>timber door</i>\n• <i>marble flooring</i>\n<i>Type <code>/bot</code> to switch modes.</i>");
+      return;
+    }
+
+    if (data === "mode:report") {
+      const project = await getGroupProject(env.DAYA_KV, chatId);
+      if (!project) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ This group isn't linked to a project yet. Use <code>/link Project Name</code> first.");
+        return;
+      }
+      await setActiveMode(env.DAYA_KV, chatId, { mode: "report", project });
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📊 <b>Report mode active.</b>\n\nWhat should the report cover? e.g.:\n• <i>delay in CEO office glass door</i>\n• <i>marble flooring decision</i>\n<i>Type <code>/bot</code> to switch modes.</i>");
+      return;
+    }
+
+    // ── Admin menu ────────────────────────────────────────────────────────────
+
+    if (data === "admin:open") {
+      await sendAdminMenu(env, chatId);
+      return;
+    }
+
+    if (data === "admin:projects") {
+      const projects = await getActiveProjects(env);
+      let listText;
+      if (projects.length === 0) {
+        listText = "📂 No active projects yet.";
+      } else {
+        const lines = [];
+        for (const p of projects) {
+          const facts = await env.DAYA_KV.get(`mem:facts:${p}`, "json") || [];
+          lines.push(`• <code>${escHtml(p)}</code> — ${facts.length} facts`);
+        }
+        listText = `<b>Active projects (${projects.length}):</b>\n` + lines.join("\n");
+      }
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, listText, [
+        [
+          { text: "🗄 Archive",   callback_data: "proj:show_archive"   },
+          { text: "📂 Unarchive", callback_data: "proj:show_unarchive" },
+        ],
+        [{ text: "➕ Add project", callback_data: "proj:add" }],
+      ]);
+      return;
+    }
+
+    if (data === "proj:show_archive") {
+      const projects = await getActiveProjects(env);
+      if (projects.length === 0) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "📂 No active projects to archive.");
+        return;
+      }
+      const buttons = projects.sort().map(p => ([{
+        text: p.length > 40 ? p.slice(0, 38) + "…" : p,
+        callback_data: `proj:archive:${p}`.slice(0, 63),
+      }]));
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "🗄 <b>Select a project to archive:</b>", buttons);
+      return;
+    }
+
+    if (data === "proj:show_unarchive") {
+      const [all, active] = await Promise.all([getAllCompanies(env), getActiveProjects(env)]);
+      const archived = all.filter(c => !active.includes(c)).sort();
+      if (archived.length === 0) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "📂 No archived projects found.");
+        return;
+      }
+      const buttons = archived.map(p => ([{
+        text: p.length > 40 ? p.slice(0, 38) + "…" : p,
+        callback_data: `proj:unarchive:${p}`.slice(0, 63),
+      }]));
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📂 <b>Select a project to unarchive:</b>", buttons);
+      return;
+    }
+
+    if (data === "admin:merge") {
+      const companies = await getAllCompanies(env);
+      if (companies.length === 0) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "📂 No companies in the database yet.");
+        return;
+      }
+      if (companies.length > 20) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          `📋 ${companies.length} companies — too many for buttons.\n\nUse <code>/bot merge</code> to type company names directly.`);
+        return;
+      }
+      const sorted = companies.sort();
+      const grid = [];
+      for (let i = 0; i < sorted.length; i += 2) {
+        const row = [{ text: sorted[i], callback_data: `merge:from:${sorted[i]}`.slice(0, 63) }];
+        if (sorted[i + 1]) row.push({ text: sorted[i + 1], callback_data: `merge:from:${sorted[i + 1]}`.slice(0, 63) });
+        grid.push(row);
+      }
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "<b>Merge companies — Step 1 of 2</b>\n\nSelect the company to merge <b>FROM</b> (the duplicate to remove):",
+        grid);
+      return;
+    }
+
+    if (data === "admin:backfill") {
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "📥 <b>Backfill emails</b>\n\nSync up to 150 emails per inbox (2 inboxes). Already-processed emails are skipped.",
+        [[
+          { text: "✅ Start backfill", callback_data: "backfill:confirm" },
+          { text: "❌ Cancel",         callback_data: "backfill:cancel"  },
+        ]]);
+      return;
+    }
+
+    if (data === "admin:aliases") {
+      const aliases = await listAliases(env);
+      let text;
+      if (aliases.length === 0) {
+        text = "📋 No custom aliases set yet.";
+      } else {
+        const lines = aliases.map(a => `• <code>${escHtml(a.source)}</code> → <code>${escHtml(a.target)}</code>`);
+        text = `<b>Custom aliases (${aliases.length}):</b>\n` + lines.join("\n");
+      }
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, text,
+        [[{ text: "➕ Add alias", callback_data: "alias:add" }]]);
+      return;
+    }
+
+    // ── Project actions ───────────────────────────────────────────────────────
+
+    if (data.startsWith("proj:archive:")) {
+      const name = data.slice("proj:archive:".length);
+      const result = await archiveProject(env, name);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        result.removed
+          ? `✅ <code>${escHtml(name)}</code> archived.\n\nFacts are preserved — new emails will no longer route here.`
+          : `⚠️ <code>${escHtml(name)}</code> was not in the active project list.`);
+      return;
+    }
+
+    if (data.startsWith("proj:unarchive:")) {
+      const name = data.slice("proj:unarchive:".length);
+      const result = await addActiveProject(env, name);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        result.added
+          ? `✅ <code>${escHtml(name)}</code> restored to active projects.\n\nNew emails will now route here.`
+          : `ℹ️ <code>${escHtml(name)}</code> is already in the active project list.`);
+      return;
+    }
+
+    if (data === "proj:add") {
+      await setBotPending(env.DAYA_KV, chatId, { type: "proj_add" });
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "➕ <b>Add project</b>\n\nReply with the project name to add to the active list.");
+      return;
+    }
+
+    // ── Merge button flow ─────────────────────────────────────────────────────
+
+    if (data.startsWith("merge:from:")) {
+      const from = data.slice("merge:from:".length);
+      const companies = await getAllCompanies(env);
+      const intoList = companies.sort().filter(c => c !== from);
+      if (intoList.length === 0) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ No other companies to merge into.");
+        return;
+      }
+      await setDraft(env.DAYA_KV, chatId, { type: "merge_from_selected", from });
+      const grid = [];
+      for (let i = 0; i < intoList.length; i += 2) {
+        const row = [{ text: intoList[i], callback_data: `merge:into:${intoList[i]}`.slice(0, 63) }];
+        if (intoList[i + 1]) row.push({ text: intoList[i + 1], callback_data: `merge:into:${intoList[i + 1]}`.slice(0, 63) });
+        grid.push(row);
+      }
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        `<b>Merge companies — Step 2 of 2</b>\n\nMerge <code>${escHtml(from)}</code> INTO which company?`,
+        grid);
+      return;
+    }
+
+    if (data.startsWith("merge:into:")) {
+      const into = data.slice("merge:into:".length);
+      const draft = await getDraft(env.DAYA_KV, chatId);
+      if (!draft || draft.type !== "merge_from_selected") {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ Merge session expired. Tap <b>🔀 Merge</b> to start again.");
+        return;
+      }
+      const { from } = draft;
+      await deleteDraft(env.DAYA_KV, chatId);
+      await setDraft(env.DAYA_KV, chatId, { type: "merge_confirm", from, into });
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        `<b>Confirm merge:</b>\n\n` +
+        `Move all facts from <code>${escHtml(from)}</code> → <code>${escHtml(into)}</code>\n` +
+        `An alias will also be added so future emails auto-route correctly.\n\n` +
+        `⚠️ This cannot be undone (except by merging back).`,
+        [[
+          { text: "✅ Yes, merge", callback_data: "merge_confirm" },
+          { text: "❌ Cancel",     callback_data: "merge_cancel"  },
+        ]]);
+      return;
+    }
+
+    // ── Backfill confirm/cancel ───────────────────────────────────────────────
+
+    if (data === "backfill:confirm") {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "⏳ Backfill started — processing up to 150 emails per inbox across 2 inboxes.\n\nAlready-processed emails are skipped. Run again to continue if needed.");
+      ctx.waitUntil(
+        fetch(`${env.MEMORY_WORKER_URL}/backfill?chatId=${encodeURIComponent(chatId)}`).catch(() => {})
+      );
+      return;
+    }
+
+    if (data === "backfill:cancel") {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "❌ Backfill cancelled.");
+      return;
+    }
+
+    // ── Alias add ─────────────────────────────────────────────────────────────
+
+    if (data === "alias:add") {
+      await setBotPending(env.DAYA_KV, chatId, { type: "alias_add" });
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "🔗 <b>Add alias</b>\n\nReply in the format:\n<code>source name → canonical name</code>\n\n" +
+        "Example: <code>malomatia 14th floor → malomatia 19th floor</code>");
+      return;
+    }
+
   } catch (err) {
     console.error(`handleCallbackQuery error (chatId ${chatId}, data ${data}): ${err.message}`);
     try {
@@ -501,6 +877,151 @@ async function handleRefineText(env, chatId, feedback, refinePending) {
       ]]
     );
   }
+}
+
+// ── Active mode dispatcher ────────────────────────────────────────────────────
+
+async function handleActiveMode(env, chatId, text, modeState) {
+  try {
+    sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+    if (modeState.mode === "qa")           await handleModeQA(env, chatId, text, modeState);
+    else if (modeState.mode === "timeline") await handleModeTimeline(env, chatId, text, modeState);
+    else if (modeState.mode === "report")   await handleModeReport(env, chatId, text, modeState);
+  } catch (err) {
+    console.error(`handleActiveMode error (chatId ${chatId}): ${err.message}`);
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      "⚠️ Something went wrong. Type <code>/bot</code> to reset.");
+  }
+}
+
+async function handleModeQA(env, chatId, text, modeState) {
+  if (await isRateLimited(env.DAYA_KV, chatId)) {
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      "⏸ Slow down — this group has sent 20 AI requests in the past hour. Try again soon.");
+    return;
+  }
+  await incrementRateLimit(env.DAYA_KV, chatId);
+  await setActiveMode(env.DAYA_KV, chatId, modeState);  // refresh TTL
+  const answer = await handleBotQuery(env, chatId, text, modeState.project, false);
+  await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, escHtml(answer));
+}
+
+async function handleModeTimeline(env, chatId, text, modeState) {
+  if (await isRateLimited(env.DAYA_KV, chatId)) {
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      "⏸ Slow down — this group has sent 20 AI requests in the past hour. Try again soon.");
+    return;
+  }
+  await incrementRateLimit(env.DAYA_KV, chatId);
+
+  if (!modeState.topic) {
+    // First message — trace this item
+    const updatedMode = { ...modeState, topic: text };
+    await setActiveMode(env.DAYA_KV, chatId, updatedMode);
+    const { text: result, clarify } = await handleTimeline(env, modeState.project, text);
+    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, result);
+    if (clarify) {
+      // Claude asked for clarification — revert so next message retries as a new item
+      await setActiveMode(env.DAYA_KV, chatId, modeState);
+    }
+  } else {
+    // Follow-up — Q&A in the context of the tracked item
+    await setActiveMode(env.DAYA_KV, chatId, modeState);  // refresh TTL
+    const answer = await handleBotQuery(env, chatId,
+      `Re: ${modeState.topic} — ${text}`,
+      modeState.project, false);
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, escHtml(answer));
+  }
+}
+
+async function handleModeReport(env, chatId, text, modeState) {
+  if (await isRateLimited(env.DAYA_KV, chatId)) {
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      "⏸ Slow down — this group has sent 20 AI requests in the past hour. Try again soon.");
+    return;
+  }
+  await incrementRateLimit(env.DAYA_KV, chatId);
+
+  if (!modeState.topic) {
+    // First message — generate report on this topic
+    const updatedMode = { ...modeState, topic: text };
+    await setActiveMode(env.DAYA_KV, chatId, updatedMode);
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `⏳ Generating report on "<b>${escHtml(text)}</b>"...`);
+    const { text: reportText, json } = await handleReport(env, chatId, text, modeState.project);
+    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
+    if (json) {
+      await setDraft(env.DAYA_KV, chatId, { type: "report", topic: text, project: modeState.project, json, iteration: 1 });
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "What would you like to do with this report?",
+        [[
+          { text: "📥 Export as Word", callback_data: "export_report" },
+          { text: "✏️ Refine",         callback_data: "refine_report" },
+        ]]);
+    }
+  } else {
+    // Subsequent message — refine the current report using the draft as source of truth
+    const draft = await getDraft(env.DAYA_KV, chatId);
+    if (!draft?.json) {
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "⚠️ Report session expired. What topic should the new report cover?");
+      await setActiveMode(env.DAYA_KV, chatId, { mode: "report", project: modeState.project });
+      return;
+    }
+    await setActiveMode(env.DAYA_KV, chatId, modeState);  // refresh TTL
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Refining report...");
+    const { text: reportText, json: newJson } = await regenerateReport(
+      env, chatId, draft.topic, draft.project, draft.json, text);
+    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
+    if (newJson) {
+      const iteration = (draft.iteration || 1) + 1;
+      await setDraft(env.DAYA_KV, chatId, { ...draft, json: newJson, iteration });
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "What would you like to do with this report?",
+        [[
+          { text: "📥 Export as Word", callback_data: "export_report" },
+          { text: "✏️ Refine",         callback_data: "refine_report" },
+        ]]);
+    }
+  }
+}
+
+// ── Query menu — 4 inline buttons for the main query commands ────────────────
+
+async function sendQueryMenu(env, chatId, projectLabel) {
+  const header = projectLabel
+    ? `🏗 <b>Daya Assistant — ${escHtml(projectLabel)}</b>\n\nTap to get started:`
+    : `🏗 <b>Daya Assistant</b>\n\nTap to get started:`;
+  const res = await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, header, [
+    [
+      { text: "❓ Q&A",      callback_data: "mode:qa" },
+      { text: "📋 Summary",  callback_data: "mode:summary" },
+    ],
+    [
+      { text: "📅 Timeline", callback_data: "mode:timeline" },
+      { text: "📊 Report",   callback_data: "mode:report" },
+    ],
+    [
+      { text: "⚙️ Admin",    callback_data: "admin:open" },
+    ],
+  ]);
+  return res?.result?.message_id;
+}
+
+async function sendAdminMenu(env, chatId) {
+  await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+    "⚙️ <b>Admin</b>\n\nSelect an action:",
+    [
+      [
+        { text: "📁 Projects", callback_data: "admin:projects" },
+        { text: "🔀 Merge",    callback_data: "admin:merge"    },
+      ],
+      [
+        { text: "📥 Backfill", callback_data: "admin:backfill" },
+        { text: "🔗 Aliases",  callback_data: "admin:aliases"  },
+      ],
+    ]
+  );
 }
 
 // ── /link handler — admin types "/link Project Name" to link group to project ──
@@ -561,12 +1082,14 @@ async function handleLink(env, chatId, text) {
 
   await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
     `✅ <b>Group linked to: ${escHtml(displayLabel)}</b>\n\n` +
-    `${matchInfo}\n\n` +
-    `Try:\n` +
-    `• <code>/bot summary</code> — project briefing\n` +
-    `• <code>/bot report</code> — generate a formal issue report\n` +
-    `• <code>/bot your question</code> — ask anything`
+    `${matchInfo}`
   );
+
+  // Send the query menu and pin it so it stays accessible at the top of the group
+  const menuMsgId = await sendQueryMenu(env, chatId, displayLabel);
+  if (menuMsgId) {
+    await pinMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, menuMsgId);
+  }
 }
 
 // ── Clarification follow-up (existing Q&A thread) ─────────────────────────────

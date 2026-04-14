@@ -96,6 +96,16 @@ export async function sendChatAction(botToken, chatId, action = "typing") {
   });
 }
 
+// Pin a message in a group chat — requires bot to have "Pin Messages" admin permission
+export async function pinMessage(botToken, chatId, messageId) {
+  await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, disable_notification: true }),
+  });
+  // fire-and-forget: if bot lacks pin permission, this silently fails
+}
+
 // Acknowledge a callback_query (required within 10s of receiving it)
 export async function answerCallback(botToken, callbackQueryId, text = "") {
   const res = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {

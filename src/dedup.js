@@ -5,8 +5,8 @@ function safeJson(val, fallback) {
   if (val === null || val === undefined) return fallback;
   try {
     return JSON.parse(val);
-  } catch {
-    console.error(`dedup: corrupt KV value (${String(val).slice(0, 80)}…), using fallback`);
+  } catch (e) {
+    console.error(`dedup: corrupt KV value — ${e.message} | value: ${String(val).slice(0, 80)}…`);
     return fallback;
   }
 }
@@ -18,6 +18,7 @@ function safeJson(val, fallback) {
 //   setup:{token}                → JSON string    (48h TTL)    — Closed Won setup tokens
 //   tg:bot:history:{chatId}      → JSON array     (2h TTL)     — conversation history
 //   tg:bot:pending:{chatId}      → JSON string    (10-min TTL) — clarification follow-up
+//   tg:bot:mode:{chatId}         → JSON object    (2h TTL)     — active mode state (qa/timeline/report)
 
 const TTL = {
   CONVERSATION:  60 * 60 * 24 * 90,  // 90 days
@@ -26,6 +27,7 @@ const TTL = {
   SETUP_TOKEN:   60 * 60 * 48,        // 48 hours
   BOT_HISTORY:   60 * 60 * 2,         // 2 hours
   BOT_PENDING:   60 * 10,             // 10 minutes
+  BOT_MODE:      60 * 60 * 2,         // 2 hours — refreshed on each message
 };
 
 // ── Email message dedup (by messageId — unique per email, not per thread) ─────
@@ -122,7 +124,12 @@ const DRAFT_TTL = 60 * 60 * 2; // 2 hours — matches BOT_HISTORY TTL
 
 export async function getDraft(kv, chatId) {
   const val = await kv.get(`tg:bot:draft:${chatId}`);
-  return safeJson(val, null);
+  const data = safeJson(val, null);
+  // Refresh TTL on every read — prevents expiry while user is actively refining a report
+  if (data !== null) {
+    await kv.put(`tg:bot:draft:${chatId}`, JSON.stringify(data), { expirationTtl: DRAFT_TTL });
+  }
+  return data;
 }
 
 export async function setDraft(kv, chatId, data) {
@@ -146,4 +153,45 @@ export async function setRefinePending(kv, chatId, data) {
 
 export async function deleteRefinePending(kv, chatId) {
   await kv.delete(`tg:bot:refine:${chatId}`);
+}
+
+// ── Active mode (qa / timeline / report) ─────────────────────────────────────
+// Persistent mode state — all plain messages are handled by the active mode
+// until the user types /bot (no args) to reset.
+// TTL refreshed on every read/write so the 2h window is from last activity.
+
+export async function getActiveMode(kv, chatId) {
+  const val = await kv.get(`tg:bot:mode:${chatId}`);
+  const data = safeJson(val, null);
+  if (data !== null) {
+    await kv.put(`tg:bot:mode:${chatId}`, JSON.stringify(data), { expirationTtl: TTL.BOT_MODE });
+  }
+  return data;
+}
+
+export async function setActiveMode(kv, chatId, data) {
+  await kv.put(`tg:bot:mode:${chatId}`, JSON.stringify(data), { expirationTtl: TTL.BOT_MODE });
+}
+
+export async function deleteActiveMode(kv, chatId) {
+  await kv.delete(`tg:bot:mode:${chatId}`);
+}
+
+// ── Per-chat rate limiting (soft anti-spam, non-atomic — race window is acceptable) ─
+// Prevents accidental Claude token burn from rapid-fire /bot commands.
+// 20 AI requests per chat per hour (sliding window via TTL reset on each increment).
+
+const RATE_LIMIT_TTL = 60 * 60; // 1 hour window
+const RATE_LIMIT_MAX = 20;       // max Claude requests per chat per window
+
+export async function isRateLimited(kv, chatId) {
+  const val = await kv.get(`ratelimit:${chatId}`);
+  return val !== null && parseInt(val, 10) >= RATE_LIMIT_MAX;
+}
+
+export async function incrementRateLimit(kv, chatId) {
+  const val = await kv.get(`ratelimit:${chatId}`);
+  const count = val ? parseInt(val, 10) : 0;
+  // Reset TTL with each increment — sliding window from last request
+  await kv.put(`ratelimit:${chatId}`, String(count + 1), { expirationTtl: RATE_LIMIT_TTL });
 }

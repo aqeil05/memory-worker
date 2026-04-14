@@ -9,7 +9,22 @@ import { claudeFetch } from "./memory.js";
 
 const CLAUDE_API = "https://api.anthropic.com/v1/messages";
 const SONNET_MODEL = "claude-sonnet-4-6";
-const HAIKU_MODEL = "claude-haiku-4-5";
+const HAIKU_MODEL = "claude-haiku-4-5-20251001";
+
+// Walk brackets to extract the first complete JSON object from text, avoiding greedy regex.
+function extractFirstJsonObject(text) {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
 
 const SUMMARY_CACHE_PREFIX = "summary:cache:";
 const SUMMARY_CACHE_TTL_S  = 25 * 60 * 60; // 25h — survives from 6AM generation to next day's cron
@@ -29,7 +44,7 @@ Facts are grouped by email thread in chronological order. Each thread shows how 
 Rules:
 - Answer ONLY from the provided facts. If the answer isn't there, say: "I don't have that in the project memory yet."
 - If the question is ambiguous (e.g. "which ceiling?" when multiple are mentioned), respond with ONLY: [CLARIFY] followed by one short clarifying question ending with "?". Do not add any other text. Example: [CLARIFY] Which ceiling are you asking about — the office or the lobby?
-- Be concise. Use bullet points with "•". Format dates as "15 Jun 2026". Currency in AED.
+- Be concise. Use bullet points with "•". Format dates as "15 Jun 2026". Currency in QAR.
 - When facts in the same thread conflict (e.g. spec changed from single to double glazed), show the evolution — what was originally decided, what changed, and what the final outcome was.
 - For report-style questions, present as a timeline with dates.
 - Never speculate or invent information not present in the facts.`;
@@ -45,7 +60,7 @@ Return ONLY valid JSON:
   "executive_summary": "3-5 sentences on current project status",
   "timeline": [{"date": "YYYY-MM-DD", "event": "what happened", "significance": "why it matters"}],
   "open_issues": [{"issue": "clear statement", "priority": "High/Medium/Low", "action_required": "specific action", "deadline": "or null"}],
-  "cost_items": [{"description": "item/trade", "amount": "AED X,XXX or TBC", "status": "Quoted/Approved/Disputed/Pending"}],
+  "cost_items": [{"description": "item/trade", "amount": "QAR X,XXX or TBC", "status": "Quoted/Approved/Disputed/Pending"}],
   "key_contacts": [{"name": "name or company", "role": "Client/Contractor/Consultant/Supplier"}],
   "risks": [{"risk": "description", "severity": "High/Medium/Low"}]
 }
@@ -242,12 +257,18 @@ async function callClaudeForSummary(env, label, facts) {
     chunks.push(facts.slice(i, i + SUMMARY_CHUNK_SIZE));
   }
 
-  // Pass 1: sequential Haiku calls with inter-chunk delay to avoid burst rate limiting.
-  // Parallel fan-out was the root cause of 429s on large summaries.
-  const chunkSummaries = [];
-  for (let idx = 0; idx < chunks.length; idx++) {
-    if (idx > 0) await new Promise(r => setTimeout(r, 500));
-    chunkSummaries.push(await summarizeChunkWithHaiku(env, label, chunks[idx], idx));
+  // Pass 1: batched-parallel Haiku calls — 3 concurrent chunks per batch, 500ms between batches.
+  // Full parallel fan-out was the root cause of 429s on large summaries; batching of 3 gives
+  // ~3× speed-up while staying safely within Haiku's rate limit.
+  const PARALLEL_BATCH = 3;
+  const chunkSummaries = new Array(chunks.length);
+  for (let i = 0; i < chunks.length; i += PARALLEL_BATCH) {
+    if (i > 0) await new Promise(r => setTimeout(r, 500));
+    const batchResults = await Promise.all(
+      chunks.slice(i, i + PARALLEL_BATCH)
+        .map((chunk, offset) => summarizeChunkWithHaiku(env, label, chunk, i + offset))
+    );
+    batchResults.forEach((r, j) => { chunkSummaries[i + j] = r; });
   }
 
   // Pass 2: Sonnet synthesis over compact summaries only
@@ -297,10 +318,10 @@ async function callClaudeForSummary(env, label, facts) {
       if (codeBlock) {
         json = JSON.parse(codeBlock[1]);
       } else {
-        // 3. Extract outermost { ... } from mixed text
-        const match = raw.match(/\{[\s\S]*\}/);
-        if (!match) throw new Error("No JSON object found in response");
-        json = JSON.parse(match[0]);
+        // 3. Extract first complete { ... } from mixed text (bracket-walker, not greedy regex)
+        const extracted = extractFirstJsonObject(raw);
+        if (!extracted) throw new Error("No JSON object found in response");
+        json = JSON.parse(extracted);
       }
     } catch (e2) {
       console.error(`Summary JSON parse failed for "${label}": ${e2.message} | Raw (first 300): ${raw.slice(0, 300)}`);
@@ -318,8 +339,7 @@ export async function handleSummary(env, chatId, project) {
   const cached = await getCachedSummary(env, company);
   if (cached?.json) {
     const text = formatSummaryText(label, cached.json, cached.generatedAt);
-    await env.DAYA_KV.put(`tg:bot:draft:${chatId}`, JSON.stringify(cached.json),
-      { expirationTtl: 2 * 60 * 60 });
+    // Draft storage is handled by the caller (telegram.js) via setDraft() with full { type, project, json } wrapper
     return { text, json: cached.json };
   }
 
@@ -332,8 +352,7 @@ export async function handleSummary(env, chatId, project) {
     const fuzzyCached = await getCachedSummary(env, matchedCompany);
     if (fuzzyCached?.json) {
       const text = formatSummaryText(label, fuzzyCached.json, fuzzyCached.generatedAt);
-      await env.DAYA_KV.put(`tg:bot:draft:${chatId}`, JSON.stringify(fuzzyCached.json),
-        { expirationTtl: 2 * 60 * 60 });
+      // Draft storage is handled by the caller (telegram.js) via setDraft() with full { type, project, json } wrapper
       return { text, json: fuzzyCached.json };
     }
   }
@@ -448,7 +467,7 @@ Rules:
 - Trace the issue chronologically — show what was originally decided, what changed, who was responsible, and the current position.
 - Use specific dates, sender names, and email subjects when citing evidence.
 - Use formal language appropriate for contract correspondence.
-- Currency in AED. Dates as "DD Mon YYYY".
+- Currency in QAR. Dates as "DD Mon YYYY".
 - The narrative should be detailed — trace every step of the issue with dates and attribution.
 - Recommendations must be actionable and specific, not generic advice.
 
@@ -525,7 +544,7 @@ export async function handleReport(env, chatId, topic, project) {
   try {
     const raw = narrativeData.content[0].text.trim();
     const codeBlock = raw.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
-    json = JSON.parse(codeBlock ? codeBlock[1] : (raw.match(/\{[\s\S]*\}/) || [raw])[0]);
+    json = JSON.parse(codeBlock ? codeBlock[1] : (extractFirstJsonObject(raw) ?? raw));
   } catch {
     throw new Error("Claude returned invalid JSON for report");
   }
@@ -564,8 +583,8 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
   const data = await res.json();
   let json;
   try {
-    const match = data.content[0].text.trim().match(/\{[\s\S]*\}/);
-    json = JSON.parse(match ? match[0] : data.content[0].text);
+    const extracted = extractFirstJsonObject(data.content[0].text.trim());
+    json = JSON.parse(extracted ?? data.content[0].text.trim());
   } catch {
     throw new Error("Claude returned invalid JSON for regenerated report");
   }
@@ -724,6 +743,7 @@ function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST) {
   }
 
   // Score each thread
+  const questionLower = question.toLowerCase();
   const scoredThreads = [];
   for (const [tid, facts] of threads.entries()) {
     let kwScore = 0;
@@ -734,6 +754,10 @@ function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST) {
         if (text.includes(kw)) kwScore += 2;
         if (subj.includes(kw)) kwScore += 1;
       }
+      // Tag bonus: +1 per fact whose tags appear verbatim in the question.
+      // e.g. "what is the cost?" boosts facts tagged ["cost"] even if "cost" isn't in the fact text.
+      // Graceful on old untagged facts — fact.tags will be undefined, optional chain short-circuits.
+      if (fact.tags?.some(tag => questionLower.includes(tag))) kwScore += 1;
     }
 
     const latestDate = new Date(facts[facts.length - 1]?.emailDate || 0).getTime();
@@ -860,4 +884,150 @@ function formatThreadCondensed(thread) {
     out += `  … (${facts.length - 2} earlier facts — ask specifically to retrieve all)\n`;
   }
   return out;
+}
+
+// ── Timeline — topic lifecycle tracer ────────────────────────────────────────
+// Traces one item (e.g. "timber door", "marble flooring") from first mention
+// through revisions, approvals, procurement, and installation.
+// Uses Haiku to select and sequence relevant facts; returns a clean event chain.
+//
+// Usage:
+//   /bot timeline timber door    → traces timber door lifecycle
+//   /bot timeline                → prompts for a topic (pending state)
+
+const TIMELINE_SYSTEM_PROMPT = `You trace the lifecycle of a specific item or topic within a fit-out / interior design project, using facts extracted from real project emails.
+
+Given a topic and relevant facts, produce a clean chronological event timeline showing how that item progressed — from initial specification or BOQ, through design iterations, revisions, client approvals, procurement, installation, defects, and closeout.
+
+If the topic is ambiguous and clearly refers to multiple distinct items (e.g. "door" when there are timber doors AND steel doors AND a glass sliding door), respond with ONLY:
+[CLARIFY] <one short clarifying question listing the options>
+
+Otherwise, return ONLY valid JSON — no markdown, no extra text:
+{
+  "topic": "Item name as understood (e.g. Timber Veneer Doors — Level 3)",
+  "events": [
+    {
+      "date": "YYYY-MM-DD",
+      "phase": "BOQ | Design | Revision | Approval | Procurement | Installation | Defect | Closeout | Update",
+      "summary": "One concise sentence. Include QAR amounts, names, or decision-makers where available."
+    }
+  ],
+  "current_status": "One sentence on the current position of this item."
+}
+
+Rules:
+- Base everything strictly on the provided facts — do not invent events.
+- Use the email date for any fact where no specific date is mentioned.
+- If fewer than 2 facts are clearly relevant, return: {"topic": "...", "events": [], "current_status": "Insufficient data on this topic."}`;
+
+// Phase → emoji mapping for clean display
+const PHASE_ICON = {
+  boq:          "📋",
+  design:       "📐",
+  revision:     "✏️",
+  approval:     "✅",
+  procurement:  "📦",
+  installation: "🔧",
+  defect:       "⚠️",
+  closeout:     "🏁",
+  update:       "📝",
+};
+
+function phaseIcon(phase = "") {
+  return PHASE_ICON[(phase || "").toLowerCase()] || "•";
+}
+
+// "YYYY-MM-DD" → "15 Mar 2024"
+function tlFmt(dateStr) {
+  if (!dateStr || dateStr < "2000-01-01") return "—";
+  const d = new Date(dateStr + "T00:00:00Z");
+  return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+}
+
+export async function handleTimeline(env, project, topic) {
+  const { company, label } = project;
+
+  const allFacts = await getAllProjectFacts(env, company);
+  if (allFacts.length === 0) {
+    return { text: `📅 No facts recorded yet for <b>${escHtml(label)}</b>.`, clarify: false };
+  }
+
+  // Use the same keyword-scored fact selection as Q&A — topic is the "question"
+  const selected = selectRelevantFacts(allFacts, topic, 120);
+
+  if (selected.length === 0) {
+    return {
+      text: `📅 No facts found relating to "<b>${escHtml(topic)}</b>" in <b>${escHtml(label)}</b>.\n\nTry a different keyword or run <code>/bot timeline</code> to choose a new topic.`,
+      clarify: false,
+    };
+  }
+
+  // Build a compact fact list for Haiku (date + text only — no subject/thread noise)
+  const factLines = selected
+    .map((f, i) => `[${i + 1}] ${(f.emailDate || "").slice(0, 10)} — ${f.fact}`)
+    .join("\n");
+
+  const res = await claudeFetch(CLAUDE_API, {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: HAIKU_MODEL,
+      max_tokens: 1200,
+      system: TIMELINE_SYSTEM_PROMPT,
+      messages: [{
+        role: "user",
+        content: `Project: ${label}\nTopic: ${topic}\n\nFacts (${selected.length} selected from ${allFacts.length} total):\n${factLines}`,
+      }],
+    }),
+  });
+
+  if (!res.ok) throw new Error(`Claude Haiku timeline error: ${res.status}`);
+
+  const data = await res.json();
+  const raw = (data.content?.[0]?.text || "").trim();
+
+  // Clarification requested — caller will show the question and re-arm pending state
+  if (raw.startsWith("[CLARIFY]")) {
+    return { text: raw.replace(/^\[CLARIFY\]\s*/, "").trim(), clarify: true };
+  }
+
+  // Parse JSON response
+  let json;
+  try {
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+    json = JSON.parse(extractFirstJsonObject(cleaned) ?? cleaned);
+  } catch {
+    throw new Error("Claude returned invalid JSON for timeline");
+  }
+
+  if (!json.events?.length) {
+    return {
+      text: `📅 <b>${escHtml(json.topic || topic)}</b>\n\n<i>${escHtml(json.current_status || "Insufficient data on this topic.")}</i>`,
+      clarify: false,
+    };
+  }
+
+  // Format as clean Telegram HTML event chain
+  const lines = [
+    `📅 <b>${escHtml(json.topic || topic)}</b>`,
+    `<i>Project: ${escHtml(label)}</i>`,
+    "",
+  ];
+
+  for (const ev of json.events) {
+    const icon = phaseIcon(ev.phase);
+    const dateStr = tlFmt(ev.date);
+    lines.push(`${icon} <b>${escHtml(ev.phase || "Update")}</b>  ·  <i>${dateStr}</i>`);
+    lines.push(`   ${escHtml(ev.summary || "")}`);
+    lines.push("");
+  }
+
+  lines.push(`📌 <b>Current Status</b>`);
+  lines.push(`   ${escHtml(json.current_status || "—")}`);
+
+  return { text: lines.join("\n"), clarify: false };
 }
