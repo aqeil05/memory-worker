@@ -1,13 +1,14 @@
 // ─── Word Document Builder ────────────────────────────────────────────────────
-// Generates valid .docx binaries using the same ZIP+OOXML approach as onedrive.js.
-// Styling: navy (#1B2A4A) headings, gold (#C9A84C) table headers, alternating rows.
+// Generates valid .docx binaries using raw OOXML + ZIP (no external deps).
+// Styling: Century Gothic, navy/gold palette, A4, 1080 DXA margins.
 
 // ── Public exports ─────────────────────────────────────────────────────────────
 
 // json = { executive_summary, timeline[], open_issues[], cost_items[], key_contacts[], risks[] }
 export function buildSummaryDocx(label, json) {
+  const title = `${label} — Project Briefing`;
   const body = [
-    h1(`${label} — Project Briefing`),
+    h1(title),
     emptyPara(),
     h2("Executive Summary"),
     para(json.executive_summary || ""),
@@ -18,7 +19,8 @@ export function buildSummaryDocx(label, json) {
     body.push(h2("Key Timeline"));
     body.push(table(
       ["Date", "Event", "Significance"],
-      json.timeline.map(t => [t.date || "", t.event || "", t.significance || ""])
+      json.timeline.map(t => [t.date || "", t.event || "", t.significance || ""]),
+      { colWidths: [1446, 4096, 3818] }
     ));
     body.push(emptyPara());
   }
@@ -27,7 +29,18 @@ export function buildSummaryDocx(label, json) {
     body.push(h2("Open Issues"));
     body.push(table(
       ["Issue", "Priority", "Action Required", "Deadline"],
-      json.open_issues.map(i => [i.issue || "", i.priority || "", i.action_required || "", i.deadline || ""])
+      json.open_issues.map(i => [i.issue || "", i.priority || "", i.action_required || "", i.deadline || ""]),
+      {
+        colWidths: [3373, 964, 3677, 1346],
+        colorCell: (colIdx, value) => {
+          if (colIdx !== 1) return null;
+          const v = String(value).toLowerCase();
+          if (v === "high")   return "FDECEA";
+          if (v === "medium") return "FFF8E7";
+          if (v === "low")    return "EAF4EA";
+          return null;
+        },
+      }
     ));
     body.push(emptyPara());
   }
@@ -59,76 +72,311 @@ export function buildSummaryDocx(label, json) {
     body.push(emptyPara());
   }
 
-  return buildDocx(body.join(""));
+  return buildDocx(body.join(""), title);
 }
 
-// json = { executive_summary, background, narrative, evidence[], impact, conclusion }
+// json = {
+//   header, progress_snapshot[], executive_summary,
+//   timeline[], impact_assessment[], decisions_required[],
+//   party_actions[], commercial_summary[]
+// }
+// Also handles legacy format: timeline_narrative (string), commercial_summary (string), impact detail field
 export function buildReportDocx(topic, label, json) {
-  const date = new Date().toISOString().slice(0, 10);
+  const h = json.header || {};
+  const reportDate = h.date || new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 
-  const body = [
-    h1(`Issue Report: ${topic}`),
-    para(`Project: ${label}`),
-    para(`Date: ${date}`),
-    emptyPara(),
-    h2("Executive Summary"),
-    para(json.executive_summary || ""),
-    emptyPara(),
-    h2("Background"),
-    para(json.background || ""),
-    emptyPara(),
-    h2("Issue Narrative"),
-    para(json.narrative || ""),
-    emptyPara(),
-  ];
+  const body = [];
 
-  if (json.evidence?.length > 0) {
-    body.push(h2(`Evidence (${json.evidence.length} emails)`));
-    body.push(table(
-      ["Date", "Sender", "Subject", "Excerpt", "Attribution"],
-      json.evidence.map(e => [e.date || "", e.sender || "", e.subject || "", e.excerpt || "", e.attribution || ""])
-    ));
+  // 1. Title Band
+  body.push(titleBand(topic, label, reportDate, h.status, h.prepared_by));
+  body.push(emptyPara());
+
+  // 2. Progress Snapshot
+  if (json.progress_snapshot?.length > 0) {
+    body.push(h2("Progress Snapshot"));
+    body.push(progressSnapshot(json.progress_snapshot));
     body.push(emptyPara());
   }
 
-  body.push(h2("Impact"));
-  body.push(para(json.impact || ""));
+  // 3. Executive Summary
+  body.push(h2("Executive Summary"));
+  const execParas = (json.executive_summary || "").split(/\n\n+/);
+  for (const p of execParas) {
+    if (p.trim()) body.push(para(p.trim()));
+  }
   body.push(emptyPara());
-  body.push(h2("Conclusion"));
-  body.push(para(json.conclusion || ""));
-  body.push(emptyPara());
-  body.push(paraItalic("Without Prejudice — Daya Interior Design"));
 
-  return buildDocx(body.join(""));
+  // 4. Timeline of Events
+  body.push(h2("Timeline of Events"));
+  if (Array.isArray(json.timeline) && json.timeline.length > 0) {
+    body.push(timelineTable(json.timeline));
+  } else if (json.timeline_narrative) {
+    // Backward compat: legacy string format
+    const tParas = json.timeline_narrative.split(/\n\n+/);
+    for (const p of tParas) if (p.trim()) body.push(para(p.trim()));
+  }
+  body.push(emptyPara());
+
+  // 5. Current Impact Assessment
+  if (json.impact_assessment?.length > 0) {
+    body.push(h2("Current Impact Assessment"));
+    body.push(impactTable(json.impact_assessment));
+    body.push(emptyPara());
+  }
+
+  // 6. Decisions Required
+  if (json.decisions_required?.length > 0) {
+    body.push(h2("Decisions Required"));
+    body.push(decisionsTable(json.decisions_required));
+    body.push(emptyPara());
+  }
+
+  // 7. What Is Needed From Each Party
+  if (json.party_actions?.length > 0) {
+    body.push(h2("What Is Needed From Each Party"));
+    body.push(partyActionsTable(json.party_actions));
+    body.push(emptyPara());
+  }
+
+  // 8. Commercial Summary
+  body.push(h2("Commercial Summary"));
+  if (Array.isArray(json.commercial_summary) && json.commercial_summary.length > 0) {
+    body.push(commercialTable(json.commercial_summary));
+  } else if (typeof json.commercial_summary === "string" && json.commercial_summary) {
+    body.push(para(json.commercial_summary));
+  }
+  body.push(emptyPara());
+
+  return buildDocx(body.join(""), `${topic} — ${label}`, reportDate);
 }
 
-// ── OOXML element builders (inline formatting — no style deps) ─────────────────
+// ── Report-specific OOXML section builders ─────────────────────────────────────
+
+// Full-width navy title band: large white title + gold subtitle line
+function titleBand(title, project, date, status, preparedBy) {
+  const subtitle = [
+    `Project: ${project}`,
+    date ? `Date: ${date}` : null,
+    status ? `Status: ${status}` : null,
+    `Prepared By: ${preparedBy || "Daya Interior Design"}`,
+  ].filter(Boolean).join("   |   ");
+
+  const noBorders =
+    `<w:tblBorders>` +
+    `<w:top w:val="none" w:sz="0" w:space="0" w:color="auto"/>` +
+    `<w:left w:val="none" w:sz="0" w:space="0" w:color="auto"/>` +
+    `<w:bottom w:val="none" w:sz="0" w:space="0" w:color="auto"/>` +
+    `<w:right w:val="none" w:sz="0" w:space="0" w:color="auto"/>` +
+    `<w:insideH w:val="none" w:sz="0" w:space="0" w:color="auto"/>` +
+    `<w:insideV w:val="none" w:sz="0" w:space="0" w:color="auto"/>` +
+    `</w:tblBorders>`;
+
+  return `<w:tbl>` +
+    `<w:tblPr>` +
+    `<w:tblW w:w="9360" w:type="dxa"/>` +
+    noBorders +
+    `<w:tblCellMar><w:top w:w="280" w:type="dxa"/><w:left w:w="360" w:type="dxa"/><w:bottom w:w="280" w:type="dxa"/><w:right w:w="360" w:type="dxa"/></w:tblCellMar>` +
+    `</w:tblPr>` +
+    `<w:tblGrid><w:gridCol w:w="9360"/></w:tblGrid>` +
+    `<w:tr>` +
+    `<w:tc>` +
+    `<w:tcPr><w:tcW w:w="9360" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="1B2A4A"/></w:tcPr>` +
+    // Title
+    `<w:p><w:pPr><w:spacing w:before="80" w:after="80"/></w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:b/><w:sz w:val="72"/><w:color w:val="FFFFFF"/></w:rPr>` +
+    `<w:t xml:space="preserve">${escXml(title)}</w:t></w:r></w:p>` +
+    // Subtitle
+    `<w:p><w:pPr><w:spacing w:before="0" w:after="100"/></w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:sz w:val="20"/><w:color w:val="C9A84C"/></w:rPr>` +
+    `<w:t xml:space="preserve">${escXml(subtitle)}</w:t></w:r></w:p>` +
+    `</w:tc>` +
+    `</w:tr>` +
+    `</w:tbl>`;
+}
+
+// Single-row 4-cell KPI snapshot
+// kpis: [{ label, value, color: "green"|"red"|"blue" }]
+function progressSnapshot(kpis) {
+  const colorMap = { green: "2E9E6B", red: "C0392B", blue: "3A6BC7" };
+  const cellW = 2340; // 9360 / 4
+  const slice = kpis.slice(0, 4);
+
+  const cells = slice.map((kpi, i) => {
+    const fill = i % 2 === 0 ? "FFFFFF" : "EEF1F7";
+    const valColor = colorMap[kpi.color] || "1B2A4A";
+    return `<w:tc>` +
+      `<w:tcPr><w:tcW w:w="${cellW}" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="${fill}"/>` +
+      `<w:tcMar><w:top w:w="80" w:type="dxa"/><w:left w:w="140" w:type="dxa"/><w:bottom w:w="80" w:type="dxa"/><w:right w:w="140" w:type="dxa"/></w:tcMar>` +
+      `</w:tcPr>` +
+      `<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="100" w:after="40"/></w:pPr>` +
+      `<w:r><w:rPr><w:rFonts ${FONT}/><w:sz w:val="18"/><w:color w:val="888888"/></w:rPr>` +
+      `<w:t xml:space="preserve">${escXml(kpi.label || "")}</w:t></w:r></w:p>` +
+      `<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="0" w:after="100"/></w:pPr>` +
+      `<w:r><w:rPr><w:rFonts ${FONT}/><w:b/><w:sz w:val="36"/><w:color w:val="${valColor}"/></w:rPr>` +
+      `<w:t xml:space="preserve">${escXml(kpi.value || "")}</w:t></w:r></w:p>` +
+      `</w:tc>`;
+  });
+
+  const gridCols = slice.map(() => `<w:gridCol w:w="${cellW}"/>`).join("");
+
+  return `<w:tbl>` +
+    `<w:tblPr><w:tblW w:w="9360" w:type="dxa"/>${TABLE_BORDERS}</w:tblPr>` +
+    `<w:tblGrid>${gridCols}</w:tblGrid>` +
+    `<w:tr>${cells.join("")}</w:tr>` +
+    `</w:tbl>`;
+}
+
+// Timeline table: Date | Event | Impact | Status (status cell colour-coded)
+// rows: [{ date, event, impact, status }]
+function timelineTable(rows) {
+  const colWidths = [1300, 2960, 3600, 1500];
+  const headers = ["Date", "Event", "Impact", "Status"];
+
+  const statusFill = (status) => {
+    const s = String(status).toLowerCase();
+    if (s.includes("resolved") && !s.includes("partial")) return "EAF4EA";
+    if (s.includes("partial") || s.includes("escalated"))  return "FFF8E7";
+    if (s.includes("missed") || s.includes("at risk") || s.includes("unresolved")) return "FDECEA";
+    return null;
+  };
+
+  return table(headers, rows.map(r => [r.date || "", r.event || "", r.impact || "", r.status || ""]), {
+    colWidths,
+    boldCols: [0],
+    colorCell: (colIdx, value) => colIdx === 3 ? statusFill(value) : null,
+  });
+}
+
+// Impact assessment table: Severity | Issue | Consequence (7 days) | Last Recorded
+// rows: [{ severity, issue, consequence, last_recorded, detail }]
+function impactTable(rows) {
+  const colWidths = [900, 2560, 4200, 1700];
+  const headers = ["Severity", "Issue", "Consequence if Unresolved (7 days)", "Last Recorded"];
+
+  const sevFill = (severity) => {
+    const s = String(severity).toLowerCase();
+    if (s.includes("critical")) return "FDECEA";
+    if (s.includes("high"))     return "FFF8E7";
+    if (s.includes("medium"))   return "FFFDE7";
+    return null;
+  };
+
+  const fmtSev = (severity) => {
+    if (/critical/i.test(severity)) return "\uD83D\uDD34 Critical";
+    if (/high/i.test(severity))     return "\uD83D\uDFE0 High";
+    if (/medium/i.test(severity))   return "\uD83D\uDFE1 Medium";
+    return severity;
+  };
+
+  return table(
+    headers,
+    rows.map(r => [
+      fmtSev(r.severity || ""),
+      r.issue || "",
+      r.consequence || r.detail || "",   // backward compat
+      r.last_recorded || "",
+    ]),
+    {
+      colWidths,
+      rowColors: rows.map(r => sevFill(r.severity || "")),
+    }
+  );
+}
+
+// Decisions required table: Decision | Owner | Deadline | Consequence of Delay
+// Deadline column always red-shaded
+function decisionsTable(rows) {
+  const colWidths = [2700, 2200, 1260, 3200];
+  const headers = ["Decision Required", "Owner", "Deadline", "Consequence of Delay"];
+
+  return table(
+    headers,
+    rows.map(r => [r.decision || "", r.owner || "", r.deadline || "", r.delay_consequence || ""]),
+    {
+      colWidths,
+      colorCell: (colIdx) => colIdx === 2 ? "FDECEA" : null,
+    }
+  );
+}
+
+// Party actions table: Party | Contact(s) | Actions Required
+function partyActionsTable(rows) {
+  const colWidths = [1700, 2160, 5500];
+  const headers = ["Party", "Contact(s)", "Actions Required"];
+
+  return table(
+    headers,
+    rows.map(r => [r.party || "", r.contacts || "", r.actions || ""]),
+    { colWidths }
+  );
+}
+
+// Commercial summary table: Item | Value / Reference | Notes / Risk
+// Flagged rows (expired quotes, unsigned PCerts, etc.) shaded red
+function commercialTable(rows) {
+  const colWidths = [2800, 2200, 4360];
+  const headers = ["Item", "Value / Reference", "Notes / Risk"];
+
+  return table(
+    headers,
+    rows.map(r => [r.item || "", r.value_ref || "", r.notes_risk || ""]),
+    {
+      colWidths,
+      rowColors: rows.map(r => r.flagged ? "FDECEA" : null),
+    }
+  );
+}
+
+// ── Shared OOXML element builders ──────────────────────────────────────────────
+
+const FONT = `w:ascii="Century Gothic" w:hAnsi="Century Gothic"`;
 
 function h1(text) {
   return `<w:p>` +
-    `<w:pPr><w:spacing w:after="120"/></w:pPr>` +
-    `<w:r><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:b/><w:sz w:val="32"/><w:color w:val="1B2A4A"/></w:rPr>` +
+    `<w:pPr><w:jc w:val="center"/><w:spacing w:after="120"/></w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:b/><w:sz w:val="36"/><w:color w:val="1B2A4A"/></w:rPr>` +
     `<w:t xml:space="preserve">${escXml(text)}</w:t></w:r></w:p>`;
 }
 
 function h2(text) {
+  // Bold navy, 26pt, gold bottom border
   return `<w:p>` +
-    `<w:pPr><w:spacing w:before="240" w:after="80"/></w:pPr>` +
-    `<w:r><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:b/><w:sz w:val="24"/><w:color w:val="1B2A4A"/></w:rPr>` +
+    `<w:pPr>` +
+    `<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="C9A84C"/></w:pBdr>` +
+    `<w:spacing w:before="320" w:after="100"/>` +
+    `</w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:b/><w:sz w:val="26"/><w:color w:val="1B2A4A"/></w:rPr>` +
     `<w:t xml:space="preserve">${escXml(text)}</w:t></w:r></w:p>`;
+}
+
+function h3(text) {
+  return `<w:p>` +
+    `<w:pPr><w:spacing w:before="160" w:after="40"/></w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:b/><w:sz w:val="22"/><w:color w:val="1B2A4A"/></w:rPr>` +
+    `<w:t xml:space="preserve">${escXml(text)}</w:t></w:r></w:p>`;
+}
+
+// Paragraph with a bold label run followed by a regular value run
+function paraLabel(label, value) {
+  return `<w:p>` +
+    `<w:pPr><w:spacing w:after="40"/></w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:b/><w:sz w:val="20"/></w:rPr>` +
+    `<w:t xml:space="preserve">${escXml(label)} </w:t></w:r>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:sz w:val="20"/></w:rPr>` +
+    `<w:t xml:space="preserve">${escXml(value)}</w:t></w:r></w:p>`;
 }
 
 function para(text) {
   return `<w:p>` +
-    `<w:pPr><w:spacing w:after="80"/></w:pPr>` +
-    `<w:r><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="20"/></w:rPr>` +
+    `<w:pPr><w:spacing w:after="80" w:line="276" w:lineRule="auto"/></w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:sz w:val="20"/></w:rPr>` +
     `<w:t xml:space="preserve">${escXml(text)}</w:t></w:r></w:p>`;
 }
 
 function paraItalic(text) {
   return `<w:p>` +
-    `<w:pPr><w:spacing w:after="80"/></w:pPr>` +
-    `<w:r><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:i/><w:sz w:val="20"/><w:color w:val="888888"/></w:rPr>` +
+    `<w:pPr><w:spacing w:after="80" w:line="276" w:lineRule="auto"/></w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:i/><w:sz w:val="20"/><w:color w:val="888888"/></w:rPr>` +
     `<w:t xml:space="preserve">${escXml(text)}</w:t></w:r></w:p>`;
 }
 
@@ -138,42 +386,73 @@ function emptyPara() {
 
 const TABLE_BORDERS =
   `<w:tblBorders>` +
-  `<w:top w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
-  `<w:left w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
+  `<w:top    w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
+  `<w:left   w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
   `<w:bottom w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
-  `<w:right w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
+  `<w:right  w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
   `<w:insideH w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
   `<w:insideV w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>` +
   `</w:tblBorders>`;
 
-function table(headers, rows) {
+// options: {
+//   colWidths?:  number[],
+//   colorCell?:  (colIdx, value) => string|null   — per-cell fill override
+//   rowColors?:  (string|null)[]                  — per-row fill override (lower priority than colorCell)
+//   boldCols?:   number[]                         — column indices to render bold
+// }
+function table(headers, rows, options = {}) {
+  const { colWidths = null, colorCell = null, rowColors = null, boldCols = [] } = options;
+  const totalWidth = colWidths ? colWidths.reduce((a, b) => a + b, 0) : 0;
+
+  const tblW = colWidths
+    ? `<w:tblW w:w="${totalWidth}" w:type="dxa"/>`
+    : `<w:tblW w:w="0" w:type="auto"/>`;
+
+  const gridCols = colWidths
+    ? colWidths.map(w => `<w:gridCol w:w="${w}"/>`).join("")
+    : headers.map(() => "<w:gridCol/>").join("");
+
+  const tcW = (colIdx) =>
+    colWidths ? `<w:tcW w:w="${colWidths[colIdx]}" w:type="dxa"/>` : "";
+
+  const CELL_MAR =
+    `<w:tcMar>` +
+    `<w:top w:w="80" w:type="dxa"/>` +
+    `<w:left w:w="140" w:type="dxa"/>` +
+    `<w:bottom w:w="80" w:type="dxa"/>` +
+    `<w:right w:w="140" w:type="dxa"/>` +
+    `</w:tcMar>`;
+
   const headerRow =
     `<w:tr>` +
-    headers.map(h =>
+    headers.map((hdr, i) =>
       `<w:tc>` +
-      `<w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="1B2A4A"/></w:tcPr>` +
-      `<w:p><w:r><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:b/><w:sz w:val="18"/><w:color w:val="FFFFFF"/></w:rPr>` +
-      `<w:t xml:space="preserve">${escXml(h)}</w:t></w:r></w:p></w:tc>`
+      `<w:tcPr>${tcW(i)}<w:shd w:val="clear" w:color="auto" w:fill="1B2A4A"/>${CELL_MAR}</w:tcPr>` +
+      `<w:p><w:r><w:rPr><w:rFonts ${FONT}/><w:b/><w:sz w:val="20"/><w:color w:val="FFFFFF"/></w:rPr>` +
+      `<w:t xml:space="preserve">${escXml(hdr)}</w:t></w:r></w:p></w:tc>`
     ).join("") +
     `</w:tr>`;
 
   const dataRows = rows.map((row, rowIdx) => {
-    const fill = rowIdx % 2 === 0 ? "F5F5F5" : "FFFFFF";
+    const defaultFill = rowIdx % 2 === 0 ? "FFFFFF" : "EEF1F7";
+    const rowOverride = rowColors ? rowColors[rowIdx] : null;
+
     return `<w:tr>` +
-      row.map(cell =>
-        `<w:tc>` +
-        `<w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="${fill}"/></w:tcPr>` +
-        `<w:p><w:r><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="18"/></w:rPr>` +
-        `<w:t xml:space="preserve">${escXml(cell)}</w:t></w:r></w:p></w:tc>`
-      ).join("") +
+      row.map((cell, colIdx) => {
+        const cellOverride = colorCell ? colorCell(colIdx, cell) : null;
+        const fill = cellOverride || rowOverride || defaultFill;
+        const bold = boldCols.includes(colIdx);
+        return `<w:tc>` +
+          `<w:tcPr>${tcW(colIdx)}<w:shd w:val="clear" w:color="auto" w:fill="${fill}"/>${CELL_MAR}</w:tcPr>` +
+          `<w:p><w:r><w:rPr><w:rFonts ${FONT}/>${bold ? "<w:b/>" : ""}<w:sz w:val="20"/></w:rPr>` +
+          `<w:t xml:space="preserve">${escXml(cell)}</w:t></w:r></w:p></w:tc>`;
+      }).join("") +
       `</w:tr>`;
   }).join("");
 
   return `<w:tbl>` +
-    `<w:tblPr><w:tblW w:w="0" w:type="auto"/>${TABLE_BORDERS}` +
-    `<w:tblCellMar><w:top w:w="80" w:type="dxa"/><w:left w:w="120" w:type="dxa"/><w:bottom w:w="80" w:type="dxa"/><w:right w:w="120" w:type="dxa"/></w:tblCellMar>` +
-    `</w:tblPr>` +
-    `<w:tblGrid>${headers.map(() => "<w:gridCol/>").join("")}</w:tblGrid>` +
+    `<w:tblPr>${tblW}${TABLE_BORDERS}</w:tblPr>` +
+    `<w:tblGrid>${gridCols}</w:tblGrid>` +
     headerRow + dataRows +
     `</w:tbl>`;
 }
@@ -189,61 +468,110 @@ function escXml(str) {
 
 // ── Core docx builder ─────────────────────────────────────────────────────────
 
-function buildDocx(bodyXml) {
+function buildDocx(bodyXml, title, reportDate = "") {
   const enc = new TextEncoder();
+  const safeTitle = escXml(title || "");
+  const safeDate  = escXml(reportDate || new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }));
 
-  const CONTENT_TYPES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-    `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+  const W   = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  const R   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const PKG = "http://schemas.openxmlformats.org/package/2006";
+
+  const CONTENT_TYPES =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<Types xmlns="${PKG}/content-types">` +
     `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
     `<Default Extension="xml" ContentType="application/xml"/>` +
     `<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>` +
     `<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>` +
     `<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>` +
+    `<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>` +
+    `<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>` +
     `</Types>`;
 
-  const RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-    `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-    `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>` +
+  const RELS =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<Relationships xmlns="${PKG}/relationships">` +
+    `<Relationship Id="rId1" Type="${R}/officeDocument" Target="word/document.xml"/>` +
     `</Relationships>`;
 
-  const DOC_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-    `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-    `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>` +
-    `<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>` +
+  const DOC_RELS =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<Relationships xmlns="${PKG}/relationships">` +
+    `<Relationship Id="rId1" Type="${R}/styles" Target="styles.xml"/>` +
+    `<Relationship Id="rId2" Type="${R}/settings" Target="settings.xml"/>` +
+    `<Relationship Id="rId3" Type="${R}/header" Target="header1.xml"/>` +
+    `<Relationship Id="rId4" Type="${R}/footer" Target="footer1.xml"/>` +
     `</Relationships>`;
 
-  const DOCUMENT = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-    `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+  const DOCUMENT =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<w:document xmlns:w="${W}" xmlns:r="${R}">` +
     `<w:body>${bodyXml}` +
-    `<w:sectPr><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>` +
+    `<w:sectPr>` +
+    `<w:pgSz w:w="11906" w:h="16838" w:orient="portrait"/>` +
+    `<w:pgMar w:top="1080" w:right="1080" w:bottom="1080" w:left="1080" w:header="709" w:footer="709" w:gutter="0"/>` +
+    `<w:headerReference w:type="default" r:id="rId3"/>` +
+    `<w:footerReference w:type="default" r:id="rId4"/>` +
+    `</w:sectPr>` +
     `</w:body></w:document>`;
 
-  const STYLES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-    `<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+  const STYLES =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<w:styles xmlns:w="${W}">` +
     `<w:docDefaults><w:rPrDefault><w:rPr>` +
-    `<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="20"/>` +
+    `<w:rFonts ${FONT}/><w:sz w:val="20"/>` +
     `</w:rPr></w:rPrDefault></w:docDefaults>` +
     `<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>` +
     `</w:styles>`;
 
-  const SETTINGS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-    `<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+  const SETTINGS =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<w:settings xmlns:w="${W}">` +
     `<w:defaultTabStop w:val="720"/>` +
     `</w:settings>`;
 
+  const HEADER =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<w:hdr xmlns:w="${W}">` +
+    `<w:p>` +
+    `<w:pPr><w:jc w:val="right"/><w:spacing w:after="0"/></w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:sz w:val="18"/><w:color w:val="888888"/></w:rPr>` +
+    `<w:t xml:space="preserve">${safeTitle}${safeDate ? "  |  " + safeDate : ""}</w:t></w:r>` +
+    `</w:p>` +
+    `</w:hdr>`;
+
+  // Footer: top border + italic grey "Without Prejudice" line
+  const footerText = `Without Prejudice \u2014 Daya Interior Design | Prepared: ${safeDate}`;
+  const FOOTER =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<w:ftr xmlns:w="${W}">` +
+    `<w:p>` +
+    `<w:pPr>` +
+    `<w:jc w:val="center"/>` +
+    `<w:spacing w:before="80" w:after="0"/>` +
+    `<w:pBdr><w:top w:val="single" w:sz="4" w:space="2" w:color="CCCCCC"/></w:pBdr>` +
+    `</w:pPr>` +
+    `<w:r><w:rPr><w:rFonts ${FONT}/><w:i/><w:sz w:val="16"/><w:color w:val="888888"/></w:rPr>` +
+    `<w:t xml:space="preserve">${escXml(footerText)}</w:t></w:r>` +
+    `</w:p>` +
+    `</w:ftr>`;
+
   const files = [
-    { name: "[Content_Types].xml", data: enc.encode(CONTENT_TYPES) },
-    { name: "_rels/.rels", data: enc.encode(RELS) },
-    { name: "word/document.xml", data: enc.encode(DOCUMENT) },
+    { name: "[Content_Types].xml",          data: enc.encode(CONTENT_TYPES) },
+    { name: "_rels/.rels",                  data: enc.encode(RELS) },
+    { name: "word/document.xml",            data: enc.encode(DOCUMENT) },
     { name: "word/_rels/document.xml.rels", data: enc.encode(DOC_RELS) },
-    { name: "word/styles.xml", data: enc.encode(STYLES) },
-    { name: "word/settings.xml", data: enc.encode(SETTINGS) },
+    { name: "word/styles.xml",              data: enc.encode(STYLES) },
+    { name: "word/settings.xml",            data: enc.encode(SETTINGS) },
+    { name: "word/header1.xml",             data: enc.encode(HEADER) },
+    { name: "word/footer1.xml",             data: enc.encode(FOOTER) },
   ];
 
   return buildZip(files);
 }
 
-// ── ZIP builder (store method — no compression, same as onedrive.js) ──────────
+// ── ZIP builder (store method — no compression) ───────────────────────────────
 
 function buildZip(files) {
   const enc = new TextEncoder();

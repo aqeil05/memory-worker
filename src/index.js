@@ -6,12 +6,13 @@
 //   - Handles Closed Won project setup links
 
 import { handleEmailWebhook, backfillEmails, processEmail } from "./email-handler.js";
-import { handleTelegramUpdate } from "./telegram.js";
+import { handleTelegramUpdate, runReportTask } from "./telegram.js";
 import { registerSubscription, renewSubscriptions } from "./graph.js";
 import { setupWorkbook, exportToExcel, getAllCompanies, appendFacts, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
-import { generateDailySummaries } from "./telegram-bot-query.js";
+import { generateDailySummaries, handleReport } from "./telegram-bot-query.js";
 import { setAlias } from "./memory.js";
-import { sendMessage } from "./notify.js";
+import { sendMessage, sendLongMessage, sendWithButtons, editMessage, escHtml } from "./notify.js";
+import { setDraft } from "./dedup.js";
 
 const INBOXES = [
   "peterkimani@wearedaya.com",
@@ -104,9 +105,26 @@ export default {
     }
 
     // GET /run-daily-summaries — manually trigger the 08:00 Qatar summary generation
+    // Optional query params: chatId, msgId — when provided, edits the Telegram message with live progress
     if (method === "GET" && url.pathname === "/run-daily-summaries") {
       const deny = requireSecret(request, env); if (deny) return deny;
-      return handleRunDailySummaries(env);
+      const chatId  = url.searchParams.get("chatId") || null;
+      const msgId   = url.searchParams.get("msgId")  ? parseInt(url.searchParams.get("msgId"), 10) : null;
+      const company = url.searchParams.get("company") || null;
+      return handleRunDailySummaries(env, chatId, msgId, company);
+    }
+
+    // POST /run-report — background report generation, self-invoked from Telegram handler
+    if (method === "POST" && url.pathname === "/run-report") {
+      const deny = requireSecret(request, env); if (deny) return deny;
+      return handleRunReport(request, env, ctx);
+    }
+
+    // POST /run-summaries-batch — process a specific subset of companies, self-invoked
+    // from the 04:00 Qatar cron. Body: { companies: string[] }
+    if (method === "POST" && url.pathname === "/run-summaries-batch") {
+      const deny = requireSecret(request, env); if (deny) return deny;
+      return handleRunSummariesBatch(request, env);
     }
 
     // GET /merge-company?from=14th+floor&into=malomatia+19th+floor
@@ -182,10 +200,21 @@ export default {
     return new Response("Not Found", { status: 404 });
   },
 
-  // ── Queue consumer: process emails with no 30s waitUntil constraint ──────
-  // Each message = { userEmail, messageId } sent by the webhook handler.
-  // processEmail throws on transient errors → queue auto-retries up to 3×.
+  // ── Queue consumer ────────────────────────────────────────────────────────
   async queue(batch, env) {
+    // Report jobs — no wall-clock limit in queue consumers (up to 15 min).
+    // runReportTask has an internal try/catch that messages Telegram on failure,
+    // so it never throws — always ack, never retry.
+    if (batch.queue === "daya-report-queue") {
+      for (const msg of batch.messages) {
+        const { chatId, topic, project } = msg.body;
+        await runReportTask(env, chatId, topic, project);
+        msg.ack();
+      }
+      return;
+    }
+
+    // Email jobs — processEmail throws on transient errors → auto-retries up to 3×.
     for (const msg of batch.messages) {
       const { userEmail, messageId } = msg.body;
       try {
@@ -199,15 +228,55 @@ export default {
   },
 
   // ── Cron handlers ─────────────────────────────────────────────────────────
-  // "0 3 * * *"    → 06:00 Qatar (UTC+3) — pre-generate & cache daily summaries
+  // "0 1 * * *"    → 04:00 Qatar (UTC+3) — main daily summaries: split into 3
+  //                   parallel batch invocations with 20s stagger
+  // "0 3 * * *"    → 06:00 Qatar (UTC+3) — retry: re-runs for any companies
+  //                   that failed in the 04:00 run (freshness skip handles the rest)
   // "0 */12 * * *" → every 12h           — renew Graph email subscriptions
   async scheduled(event, env, ctx) {
-    if (event.cron === "0 3 * * *") {
+    if (event.cron === "0 1 * * *") {
+      // Main run: split all companies into 3 batches and fire in parallel.
+      // Each batch runs as an independent HTTP invocation (/run-summaries-batch)
+      // with its own CPU budget, so a network blip affects only one batch and
+      // the sequential processing is never constrained by a single 15-min limit.
       try {
-        await generateDailySummaries(env);
+        const allCompanies = await getAllCompanies(env);
+        const size = Math.ceil(allCompanies.length / 3);
+        const batches = [
+          allCompanies.slice(0, size),
+          allCompanies.slice(size, size * 2),
+          allCompanies.slice(size * 2),
+        ].filter(b => b.length > 0);
+
+        console.log(`Daily summaries main run: ${allCompanies.length} companies → ${batches.length} batches`);
+        batches.forEach((batch, idx) => {
+          ctx.waitUntil(
+            new Promise(r => setTimeout(r, idx * 20_000)) // 20s stagger between batches
+              .then(() => fetch(`${env.MEMORY_WORKER_URL}/run-summaries-batch`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${env.INTERNAL_SECRET}`,
+                },
+                body: JSON.stringify({ companies: batch }),
+              }))
+              .catch(err => console.error(`Summary batch ${idx} failed to fire: ${err.message}`))
+          );
+        });
       } catch (err) {
-        console.error(`generateDailySummaries crashed: ${err.stack || err.message}`);
+        console.error(`Daily summaries main run crashed: ${err.stack || err.message}`);
       }
+
+    } else if (event.cron === "0 3 * * *") {
+      // Retry run: skipFresh=true so only companies that failed (or were never
+      // processed) in the 04:00 batch run are regenerated. Companies with a fresh
+      // summary (< 2.5 hours old) are silently skipped.
+      try {
+        await generateDailySummaries(env, null, null, null, true);
+      } catch (err) {
+        console.error(`generateDailySummaries retry crashed: ${err.stack || err.message}`);
+      }
+
     } else {
       try {
         await renewSubscriptions(env);
@@ -368,14 +437,42 @@ async function handleBackfill(request, env, ctx) {
 
 // ── GET /run-daily-summaries — manually trigger the 08:00 Qatar summary job ───
 
-async function handleRunDailySummaries(env) {
+function summaryProgressBar(done, total, company) {
+  const pct   = Math.round(done / total * 100);
+  const filled = Math.round(done / total * 16);
+  const bar   = "█".repeat(filled) + "░".repeat(16 - filled);
+  return `🔄 <b>Regenerating summaries…</b>\n${bar} ${done}/${total} (${pct}%)\n📌 ${escHtml(company)}`;
+}
+
+async function handleRunDailySummaries(env, chatId = null, msgId = null, company = null) {
+  const onProgress = (chatId && msgId)
+    ? async (done, total, co) => {
+        await editMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, msgId,
+          summaryProgressBar(done, total, co));
+      }
+    : null;
+
   try {
-    const result = await generateDailySummaries(env);
+    const result = await generateDailySummaries(env, onProgress, company);
+    if (chatId && msgId) {
+      const lines = [];
+      if (result.cached.length)  lines.push(`• ${result.cached.length} updated`);
+      if (result.skipped.length) lines.push(`• ${result.skipped.length} skipped (no recent activity)`);
+      if (result.failed.length)  lines.push(`• ${result.failed.length} failed`);
+      await editMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, msgId,
+        `✅ <b>Summaries regenerated.</b>\n${lines.join("\n") || "• Nothing to update."}`
+      ).catch(() => {});
+    }
     return new Response(JSON.stringify({ ok: true, ...result }), {
       headers: { "Content-Type": "application/json" },
     });
   } catch (err) {
     console.error(`generateDailySummaries crashed: ${err.stack || err.message}`);
+    if (chatId && msgId) {
+      await editMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, msgId,
+        `❌ <b>Summary regeneration failed:</b> ${escHtml(err.message)}`
+      ).catch(() => {});
+    }
     return new Response(JSON.stringify({ ok: false, error: err.message }), {
       status: 500, headers: { "Content-Type": "application/json" },
     });
@@ -415,6 +512,90 @@ async function handleMergeCompany(url, env) {
       status: 500, headers: { "Content-Type": "application/json" },
     });
   }
+}
+
+// ── POST /run-summaries-batch — process a company subset (self-invoked) ─────────
+// Called by the 04:00 Qatar cron handler for each of the 3 parallel batches.
+// Runs synchronously in a fresh HTTP invocation with its own CPU budget.
+
+async function handleRunSummariesBatch(request, env) {
+  let companies;
+  try {
+    ({ companies } = await request.json());
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400, headers: { "Content-Type": "application/json" },
+    });
+  }
+  if (!Array.isArray(companies) || companies.length === 0) {
+    return new Response(JSON.stringify({ error: "companies must be a non-empty array" }), {
+      status: 400, headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  console.log(`run-summaries-batch: processing ${companies.length} companies`);
+  try {
+    const result = await generateDailySummaries(env, null, null, companies);
+    console.log(`run-summaries-batch: done — ${result.cached.length} cached, ${result.skipped.length} skipped, ${result.failed.length} failed`);
+    return new Response(JSON.stringify({ ok: true, ...result }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.error(`run-summaries-batch crashed: ${err.stack || err.message}`);
+    return new Response(JSON.stringify({ ok: false, error: err.message }), {
+      status: 500, headers: { "Content-Type": "application/json" },
+    });
+  }
+}
+
+// ── POST /run-report — background report generation (self-invoked) ────────────
+// Returns 200 immediately so the HTTP request completes before Cloudflare's
+// 30-second wall-clock timeout. The heavy Claude call runs inside ctx.waitUntil()
+// which is IO-bound (near-zero CPU) and is not subject to the request timeout.
+
+async function handleRunReport(request, env, ctx) {
+  console.log("run-report: endpoint hit");
+  let chatId, topic, project;
+  try {
+    ({ chatId, topic, project } = await request.json());
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400, headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  console.log(`run-report: parsed [${chatId}] topic="${topic}" project="${project?.company}"`);
+
+  ctx.waitUntil((async () => {
+    try {
+      const { text: reportText, json } = await handleReport(env, chatId, topic, project);
+      await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
+
+      if (json) {
+        await setDraft(env.DAYA_KV, chatId, { type: "report", topic, project, json, iteration: 1 });
+        await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "What would you like to do with this report?",
+          [[
+            { text: "📄 Export as Word", callback_data: "export_report" },
+            { text: "📑 Export as PDF",  callback_data: "export_report_pdf" },
+          ], [
+            { text: "✏️ Refine", callback_data: "refine_report" },
+          ]]
+        );
+      }
+
+      console.log(`run-report done [${chatId}]`);
+    } catch (err) {
+      console.error(`run-report failed [${chatId}]: ${err.stack || err.message}`);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        `❌ Report generation failed: ${escHtml(err.message)}`
+      ).catch(() => {});
+    }
+  })());
+
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 // ── GET /setup-db — create OneDrive Excel workbook ────────────────────────────

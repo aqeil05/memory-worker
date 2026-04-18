@@ -17,7 +17,7 @@
 //   /bot addproject · /bot archiveproject · /bot alias · /bot alias list
 
 import { handleBotQuery, handleSummary, handleReport, regenerateReport, handleTimeline } from "./telegram-bot-query.js";
-import { linkGroup, getGroupProject, uploadReport, matchingCompanies, getAllCompanies, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
+import { linkGroup, getGroupProject, uploadReport, downloadItemAsPdf, uploadPdfReport, matchingCompanies, getAllCompanies, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
 import { normalizeCompany, setAlias, listAliases } from "./memory.js";
 import { buildSummaryDocx, buildReportDocx } from "./docx.js";
 import {
@@ -27,7 +27,7 @@ import {
   getActiveMode, setActiveMode, deleteActiveMode,
   isRateLimited, incrementRateLimit,
 } from "./dedup.js";
-import { sendMessage, sendLongMessage, sendWithButtons, answerCallback, escHtml, sendChatAction, pinMessage } from "./notify.js";
+import { sendMessage, sendLongMessage, sendWithButtons, answerCallback, escHtml, sendChatAction, pinMessage, sendDocument } from "./notify.js";
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -94,7 +94,7 @@ async function handleGroupMessage(env, ctx, chatId, text) {
     // Active mode: all plain messages handled by the current mode until /bot resets
     const modeState = await getActiveMode(env.DAYA_KV, chatId);
     if (modeState) {
-      await handleActiveMode(env, chatId, text, modeState);
+      await handleActiveMode(env, ctx, chatId, text, modeState);
       return;
     }
 
@@ -105,7 +105,7 @@ async function handleGroupMessage(env, ctx, chatId, text) {
       return;
     }
     if (pending?.type === "report") {
-      await handleReportTopic(env, chatId, text, pending.project);
+      await handleReportTopic(env, ctx, chatId, text, pending.project);
       return;
     }
     if (pending?.type === "timeline") {
@@ -339,8 +339,11 @@ async function handleBotCommand(env, ctx, chatId, text) {
     if (json) {
       await setDraft(env.DAYA_KV, chatId, { type: "summary", project, json });
       await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-        "Export this briefing as a Word document?",
-        [[{ text: "📥 Export as Word", callback_data: "export_summary" }]]
+        "Export this briefing?",
+        [[
+          { text: "📄 Export as Word", callback_data: "export_summary" },
+          { text: "📑 Export as PDF",  callback_data: "export_summary_pdf" },
+        ]]
       );
     }
     return;
@@ -398,28 +401,45 @@ async function handleTimelineTopic(env, chatId, topic, project) {
   await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, text);
 }
 
+// ── Shared report background task ────────────────────────────────────────────
+// Called by the Cloudflare Queue consumer in index.js — no wall-clock limit.
+// Exported so index.js can import it for the queue handler.
+
+export async function runReportTask(env, chatId, topic, project) {
+  console.log(`runReportTask start [${chatId}] topic="${topic}" project="${project?.company}"`);
+  try {
+    const { text: reportText, json } = await handleReport(env, chatId, topic, project);
+    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
+
+    if (json) {
+      await setDraft(env.DAYA_KV, chatId, { type: "report", topic, project, json, iteration: 1 });
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "What would you like to do with this report?",
+        [[
+          { text: "📄 Export as Word", callback_data: "export_report" },
+          { text: "📑 Export as PDF",  callback_data: "export_report_pdf" },
+        ], [
+          { text: "✏️ Refine", callback_data: "refine_report" },
+        ]]
+      );
+    }
+    console.log(`runReportTask done [${chatId}]`);
+  } catch (err) {
+    console.error(`runReportTask failed [${chatId}]: ${err.stack || err.message}`);
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      `❌ Report generation failed: ${escHtml(err.message)}`
+    ).catch(() => {});
+  }
+}
+
 // ── Report topic received (follow-up after /bot report) ───────────────────────
 
-async function handleReportTopic(env, chatId, topic, project) {
+async function handleReportTopic(env, ctx, chatId, topic, project) {
   await deleteBotPending(env.DAYA_KV, chatId);
-
   await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
     `⏳ Generating report on "<b>${escHtml(topic)}</b>"...`
   );
-
-  const { text: reportText, json } = await handleReport(env, chatId, topic, project);
-  await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
-
-  if (json) {
-    await setDraft(env.DAYA_KV, chatId, { type: "report", topic, project, json, iteration: 1 });
-    await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-      "What would you like to do with this report?",
-      [[
-        { text: "📥 Export as Word", callback_data: "export_report" },
-        { text: "✏️ Refine", callback_data: "refine_report" },
-      ]]
-    );
-  }
+  await env.REPORT_QUEUE.send({ chatId, topic, project });
 }
 
 // ── Guided merge flow ─────────────────────────────────────────────────────────
@@ -484,11 +504,40 @@ async function handleCallbackQuery(env, ctx, chatId, data, callbackQueryId) {
       await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Generating Word document...");
       const docx = buildSummaryDocx(draft.project.label, draft.json);
       const filename = `${safeName(draft.project.label)}_Briefing_${today()}.docx`;
-      const webUrl = await uploadReport(env, filename, docx);
-      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-        `📄 <b>Word document ready:</b>\n<a href="${webUrl}">${escHtml(filename)}</a>`
-      );
-      await deleteDraft(env.DAYA_KV, chatId);
+      // Upload to OneDrive for archival, skipping if this exact summary was already uploaded
+      const hash = summaryHash(draft.json);
+      const dedupKey = `summary:onedrive:${safeName(draft.project.label)}:${hash}`;
+      if (!(await env.DAYA_KV.get(dedupKey))) {
+        const { id: itemId } = await uploadReport(env, filename, docx);
+        await env.DAYA_KV.put(dedupKey, itemId, { expirationTtl: 90000 });
+      }
+      await sendDocument(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, docx,
+        filename, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      return;
+    }
+
+    if (data === "export_summary_pdf") {
+      const draft = await getDraft(env.DAYA_KV, chatId);
+      if (!draft?.json) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ Session expired — summaries are saved for 2 hours. Run <code>/bot summary</code> to generate a fresh one.");
+        return;
+      }
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Generating PDF...");
+      const docx = buildSummaryDocx(draft.project.label, draft.json);
+      const docxFilename = `${safeName(draft.project.label)}_Briefing_${today()}.docx`;
+      // Reuse existing OneDrive item if this summary was already uploaded; otherwise upload now
+      const hash = summaryHash(draft.json);
+      const dedupKey = `summary:onedrive:${safeName(draft.project.label)}:${hash}`;
+      let itemId = await env.DAYA_KV.get(dedupKey);
+      if (!itemId) {
+        const { id } = await uploadReport(env, docxFilename, docx);
+        itemId = id;
+        await env.DAYA_KV.put(dedupKey, itemId, { expirationTtl: 90000 });
+      }
+      const pdfBytes = await downloadItemAsPdf(env, itemId);
+      const pdfFilename = `${safeName(draft.project.label)}_Briefing_${today()}.pdf`;
+      await sendDocument(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, pdfBytes, pdfFilename, "application/pdf");
       return;
     }
 
@@ -503,11 +552,27 @@ async function handleCallbackQuery(env, ctx, chatId, data, callbackQueryId) {
       const docx = buildReportDocx(draft.topic, draft.project.label, draft.json);
       const topicSlug = safeName(draft.topic || "report").slice(0, 30);
       const filename = `${safeName(draft.project.label)}_Report_${topicSlug}_${today()}.docx`;
-      const webUrl = await uploadReport(env, filename, docx);
-      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-        `📄 <b>Word document ready:</b>\n<a href="${webUrl}">${escHtml(filename)}</a>`
-      );
-      await deleteDraft(env.DAYA_KV, chatId);
+      await uploadReport(env, filename, docx);
+      await sendDocument(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, docx,
+        filename, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      return;
+    }
+
+    if (data === "export_report_pdf") {
+      const draft = await getDraft(env.DAYA_KV, chatId);
+      if (!draft?.json) {
+        await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+          "⚠️ Session expired — reports are saved for 2 hours. Run <code>/bot report</code> to generate a fresh one.");
+        return;
+      }
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Generating PDF...");
+      const docx = buildReportDocx(draft.topic, draft.project.label, draft.json);
+      const topicSlug = safeName(draft.topic || "report").slice(0, 30);
+      const docxFilename = `${safeName(draft.project.label)}_Report_${topicSlug}_${today()}.docx`;
+      const { id: itemId } = await uploadReport(env, docxFilename, docx);
+      const pdfBytes = await downloadItemAsPdf(env, itemId);
+      const pdfFilename = `${safeName(draft.project.label)}_Report_${topicSlug}_${today()}.pdf`;
+      await sendDocument(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, pdfBytes, pdfFilename, "application/pdf");
       return;
     }
 
@@ -584,8 +649,11 @@ async function handleCallbackQuery(env, ctx, chatId, data, callbackQueryId) {
       if (json) {
         await setDraft(env.DAYA_KV, chatId, { type: "summary", project, json });
         await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-          "Export this briefing as a Word document?",
-          [[{ text: "📥 Export as Word", callback_data: "export_summary" }]]);
+          "Export this briefing?",
+          [[
+            { text: "📄 Export as Word", callback_data: "export_summary" },
+            { text: "📑 Export as PDF",  callback_data: "export_summary_pdf" },
+          ]]);
       }
       // Summary is one-shot — show the menu again for the next action
       await sendQueryMenu(env, chatId, project.label);
@@ -742,6 +810,22 @@ async function handleCallbackQuery(env, ctx, chatId, data, callbackQueryId) {
       return;
     }
 
+    if (data === "admin:summaries") {
+      const total = (await getAllCompanies(env)).length;
+      const bar   = "░".repeat(16);
+      const initRes = await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        `🔄 <b>Regenerating summaries…</b>\n${bar} 0/${total} (0%)`);
+      const msgId = initRes?.result?.message_id;
+      const params = new URLSearchParams({ chatId });
+      if (msgId) params.set("msgId", String(msgId));
+      ctx.waitUntil(
+        fetch(`${env.MEMORY_WORKER_URL}/run-daily-summaries?${params}`, {
+          headers: { Authorization: `Bearer ${env.INTERNAL_SECRET}` },
+        }).catch(() => {})
+      );
+      return;
+    }
+
     // ── Project actions ───────────────────────────────────────────────────────
 
     if (data.startsWith("proj:archive:")) {
@@ -872,7 +956,9 @@ async function handleRefineText(env, chatId, feedback, refinePending) {
     await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
       "What would you like to do with this report?",
       [[
-        { text: "📥 Export as Word", callback_data: "export_report" },
+        { text: "📄 Export as Word", callback_data: "export_report" },
+        { text: "📑 Export as PDF",  callback_data: "export_report_pdf" },
+      ], [
         { text: "✏️ Refine", callback_data: "refine_report" },
       ]]
     );
@@ -881,12 +967,12 @@ async function handleRefineText(env, chatId, feedback, refinePending) {
 
 // ── Active mode dispatcher ────────────────────────────────────────────────────
 
-async function handleActiveMode(env, chatId, text, modeState) {
+async function handleActiveMode(env, ctx, chatId, text, modeState) {
   try {
     sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
     if (modeState.mode === "qa")           await handleModeQA(env, chatId, text, modeState);
     else if (modeState.mode === "timeline") await handleModeTimeline(env, chatId, text, modeState);
-    else if (modeState.mode === "report")   await handleModeReport(env, chatId, text, modeState);
+    else if (modeState.mode === "report")   await handleModeReport(env, ctx, chatId, text, modeState);
   } catch (err) {
     console.error(`handleActiveMode error (chatId ${chatId}): ${err.message}`);
     await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
@@ -934,7 +1020,8 @@ async function handleModeTimeline(env, chatId, text, modeState) {
   }
 }
 
-async function handleModeReport(env, chatId, text, modeState) {
+async function handleModeReport(env, ctx, chatId, text, modeState) {
+  console.log(`handleModeReport [${chatId}] topic="${text}" project="${modeState.project?.company}"`);
   if (await isRateLimited(env.DAYA_KV, chatId)) {
     await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
       "⏸ Slow down — this group has sent 20 AI requests in the past hour. Try again soon.");
@@ -943,22 +1030,12 @@ async function handleModeReport(env, chatId, text, modeState) {
   await incrementRateLimit(env.DAYA_KV, chatId);
 
   if (!modeState.topic) {
-    // First message — generate report on this topic
+    // First message — enqueue report job. Queue consumer runs with no wall-clock limit.
     const updatedMode = { ...modeState, topic: text };
     await setActiveMode(env.DAYA_KV, chatId, updatedMode);
     await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
       `⏳ Generating report on "<b>${escHtml(text)}</b>"...`);
-    const { text: reportText, json } = await handleReport(env, chatId, text, modeState.project);
-    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
-    if (json) {
-      await setDraft(env.DAYA_KV, chatId, { type: "report", topic: text, project: modeState.project, json, iteration: 1 });
-      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-        "What would you like to do with this report?",
-        [[
-          { text: "📥 Export as Word", callback_data: "export_report" },
-          { text: "✏️ Refine",         callback_data: "refine_report" },
-        ]]);
-    }
+    await env.REPORT_QUEUE.send({ chatId, topic: text, project: modeState.project });
   } else {
     // Subsequent message — refine the current report using the draft as source of truth
     const draft = await getDraft(env.DAYA_KV, chatId);
@@ -979,7 +1056,9 @@ async function handleModeReport(env, chatId, text, modeState) {
       await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
         "What would you like to do with this report?",
         [[
-          { text: "📥 Export as Word", callback_data: "export_report" },
+          { text: "📄 Export as Word", callback_data: "export_report" },
+          { text: "📑 Export as PDF",  callback_data: "export_report_pdf" },
+        ], [
           { text: "✏️ Refine",         callback_data: "refine_report" },
         ]]);
     }
@@ -1019,6 +1098,9 @@ async function sendAdminMenu(env, chatId) {
       [
         { text: "📥 Backfill", callback_data: "admin:backfill" },
         { text: "🔗 Aliases",  callback_data: "admin:aliases"  },
+      ],
+      [
+        { text: "🔄 Regenerate summaries", callback_data: "admin:summaries" },
       ],
     ]
   );
@@ -1107,5 +1189,14 @@ function safeName(str) {
 }
 
 function today() {
-  return new Date().toISOString().slice(0, 10);
+  // Include HH-MM so repeated exports never try to overwrite an open OneDrive file (423 resourceLocked)
+  return new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "-");
+}
+
+// djb2 hash of the summary JSON — used to detect duplicate OneDrive uploads for the same summary version
+function summaryHash(json) {
+  const str = JSON.stringify(json);
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
+  return (h >>> 0).toString(36);
 }

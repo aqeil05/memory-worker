@@ -96,6 +96,18 @@ export async function sendChatAction(botToken, chatId, action = "typing") {
   });
 }
 
+// Edit an existing message in-place (used for live progress updates)
+export async function editMessage(botToken, chatId, messageId, text) {
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" }),
+  });
+  const json = await res.json();
+  if (!json.ok) console.error("Telegram editMessage error:", JSON.stringify(json));
+  return json;
+}
+
 // Pin a message in a group chat — requires bot to have "Pin Messages" admin permission
 export async function pinMessage(botToken, chatId, messageId) {
   await fetch(`https://api.telegram.org/bot${botToken}/pinChatMessage`, {
@@ -104,6 +116,26 @@ export async function pinMessage(botToken, chatId, messageId) {
     body: JSON.stringify({ chat_id: chatId, message_id: messageId, disable_notification: true }),
   });
   // fire-and-forget: if bot lacks pin permission, this silently fails
+}
+
+// Send a file directly to a Telegram chat as a document attachment
+export async function sendDocument(botToken, chatId, fileBytes, filename, mimeType, caption = "") {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("document", new File([fileBytes], filename, { type: mimeType }));
+  if (caption) {
+    form.append("caption", caption);
+    form.append("parse_mode", "HTML");
+  }
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
+    method: "POST",
+    body: form,
+  });
+  const json = await res.json();
+  if (!json.ok) {
+    console.error("Telegram sendDocument error:", JSON.stringify(json));
+  }
+  return json;
 }
 
 // Acknowledge a callback_query (required within 10s of receiving it)

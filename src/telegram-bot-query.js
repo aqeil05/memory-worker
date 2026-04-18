@@ -12,16 +12,19 @@ const SONNET_MODEL = "claude-sonnet-4-6";
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
 // Walk brackets to extract the first complete JSON object from text, avoiding greedy regex.
+// String-aware: ignores { and } inside quoted strings (handles escaped characters too).
 function extractFirstJsonObject(text) {
   const start = text.indexOf("{");
   if (start === -1) return null;
-  let depth = 0;
+  let depth = 0, inString = false, escape = false;
   for (let i = start; i < text.length; i++) {
-    if (text[i] === "{") depth++;
-    else if (text[i] === "}") {
-      depth--;
-      if (depth === 0) return text.slice(start, i + 1);
-    }
+    const ch = text[i];
+    if (escape)          { escape = false; continue; }
+    if (ch === "\\")     { escape = true;  continue; }
+    if (ch === '"')      { inString = !inString; continue; }
+    if (inString)        continue;
+    if (ch === "{")      depth++;
+    else if (ch === "}") { depth--; if (depth === 0) return text.slice(start, i + 1); }
   }
   return null;
 }
@@ -285,7 +288,7 @@ async function callClaudeForSummary(env, label, facts) {
     },
     body: JSON.stringify({
       model: SONNET_MODEL,
-      max_tokens: 4096,
+      max_tokens: 8192,
       system: SUMMARY_SYSTEM_PROMPT,
       messages: [{
         role: "user",
@@ -364,38 +367,47 @@ export async function handleSummary(env, chatId, project) {
 }
 
 // Called by the 08:00 Qatar cron — pre-generates and caches summaries for all companies.
-export async function generateDailySummaries(env) {
-  const companies = await getAllCompanies(env);
+// companyList: if provided, process only these companies (used by /run-summaries-batch).
+// skipFresh: if true, skip companies whose summary was generated within the last 2.5 hours
+//            (used by the 06:00 Qatar retry cron to avoid re-processing successful batches).
+export async function generateDailySummaries(env, onProgress = null, companyFilter = null, companyList = null, skipFresh = false) {
+  const allCompanies = companyList || await getAllCompanies(env);
+  const companies = companyFilter
+    ? allCompanies.filter(c => c.toLowerCase() === companyFilter.toLowerCase())
+    : allCompanies;
+  const total = companies.length;
   const cutoff = getTenDayCutoff();
   const cached = [], skipped = [], failed = [];
 
-  for (const company of companies) {
+  for (let i = 0; i < total; i++) {
+    const company = companies[i];
     try {
       const allFacts = await getAllProjectFacts(env, company);
       const recent = allFacts.filter(f => (f.emailDate || "").slice(0, 10) >= cutoff);
       if (!recent.length) {
-        await env.DAYA_KV.delete(`${SUMMARY_CACHE_PREFIX}${company}`);
+        // No activity in last 10 days — preserve any existing cache, skip regeneration
         skipped.push(company);
         continue;
       }
 
-      // Skip regeneration when cache is fresh and no new emails have arrived.
-      // appendFacts() sets mem:dirty:{company} on every new email ingestion.
-      const isDirty = await env.DAYA_KV.get(`mem:dirty:${company}`);
-      const existingCache = await getCachedSummary(env, company);
-      if (existingCache?.json && !isDirty) {
-        // Rewrite the cache entry to reset its TTL. Without this, a summary generated
-        // at 06:00 on day N would expire around 07:00 on day N+1 — about an hour after
-        // the next cron runs — because the 25h TTL counts from original creation, not
-        // from when the cron last ran. Rewriting here keeps the summary alive continuously.
-        await setCachedSummary(env, company, existingCache);
-        skipped.push(company);
-        continue;
+      // Retry run only: skip companies that already have a fresh summary from the
+      // earlier batch run. 2.5h window covers the full 04:00→06:00 Qatar gap.
+      if (skipFresh) {
+        const existing = await getCachedSummary(env, company).catch(() => null);
+        if (existing?.generatedAt) {
+          const ageMs = Date.now() - new Date(existing.generatedAt).getTime();
+          if (ageMs < 2.5 * 60 * 60 * 1000) {
+            skipped.push(company);
+            continue;
+          }
+        }
       }
 
+      // Always regenerate for active projects — ensures a fresh summary every morning
+      // regardless of whether new emails arrived since the previous cron run.
       const json = await callClaudeForSummary(env, company, recent);
       await setCachedSummary(env, company, { json, generatedAt: new Date().toISOString() });
-      // Clear the dirty flag now that the cache is up to date.
+      // Clear dirty flag if set — keeps KV tidy even though we no longer gate on it.
       await env.DAYA_KV.delete(`mem:dirty:${company}`);
       console.log(`Daily summary cached for "${company}" (${recent.length} facts)`);
       cached.push({ company, facts: recent.length });
@@ -403,6 +415,8 @@ export async function generateDailySummaries(env) {
       console.error(`Daily summary failed for "${company}": ${err.message}`);
       failed.push({ company, error: err.message });
     } finally {
+      // Report progress before the inter-company delay so the update feels immediate.
+      if (onProgress) await onProgress(i + 1, total, company).catch(() => {});
       // Always pace inter-company requests — including after failures — to avoid burst 429s.
       await new Promise(r => setTimeout(r, 1500));
     }
@@ -460,29 +474,73 @@ function buildReportContextBlock(topic, label, facts, totalCount) {
 
 const REPORT_SYSTEM_PROMPT = `You are a professional report writer for Daya Interior Design (Doha, Qatar) — a fit-out, interior design, and project management company.
 
-Write formal issue/delay reports suitable for clients, contract administrators, or legal use.
+Write a formal project status report based strictly on the provided facts.
 
 Rules:
-- Base all content strictly on the provided facts. Do not invent or speculate.
-- Trace the issue chronologically — show what was originally decided, what changed, who was responsible, and the current position.
-- Use specific dates, sender names, and email subjects when citing evidence.
-- Use formal language appropriate for contract correspondence.
-- Currency in QAR. Dates as "DD Mon YYYY".
-- The narrative should be detailed — trace every step of the issue with dates and attribution.
-- Recommendations must be actionable and specific, not generic advice.
+- Do not invent, speculate, or fill gaps with assumptions.
+- If something is ambiguous, reflect that ambiguity honestly in the report.
+- Preserve all reference numbers, contract values, amounts, and names exactly as they appear in the source facts.
+- Currency in QAR. Dates as "DD Mon YYYY". Formal language throughout.
 
 Return ONLY valid JSON with this exact structure:
 {
-  "executive_summary": "3-5 sentences summarising the issue and current status",
-  "background": "2-4 sentences of project context relevant to this issue",
-  "narrative": "Detailed chronological account (8-15 sentences) tracing the issue's full evolution with specific dates, senders, and decisions at each step",
-  "evidence": [{"date": "YYYY-MM-DD", "sender": "name or email", "subject": "email subject", "excerpt": "most relevant sentence from the email", "attribution": "Client/Supplier/Daya — brief explanation of this item's significance"}],
-  "timeline": [{"date": "YYYY-MM-DD", "event": "what happened", "significance": "why it matters"}],
-  "impact": "3-5 sentences on programme and cost impact, including any quantified delays or cost figures from the evidence",
-  "recommendations": ["specific actionable recommendation 1", "specific actionable recommendation 2"],
-  "conclusion": "3-5 sentences with a clear closing position"
+  "header": {
+    "project": "full project label",
+    "date": "DD Mon YYYY",
+    "prepared_by": "Daya Interior Design",
+    "status": "On Track | At Risk | Delayed — one short phrase reflecting the current situation"
+  },
+  "progress_snapshot": [
+    { "label": "Short KPI label e.g. Completion, Open Issues, Trades Complete, Next Milestone", "value": "e.g. 72% or 4 items or 15 May 2025", "color": "green | red | blue" }
+  ],
+  "executive_summary": "2–3 prose paragraphs separated by \\n\\n. Cover: where the project stands today, the overall mood (on track / at risk / delayed), and the single most critical action needed this week.",
+  "timeline": [
+    {
+      "date": "DD Mon YYYY",
+      "event": "What happened — one concise sentence",
+      "impact": "Why it mattered or what it blocked/unblocked",
+      "status": "Resolved | Partially resolved | Escalated | Missed | At risk | Unresolved"
+    }
+  ],
+  "impact_assessment": [
+    {
+      "severity": "Critical | High | Medium",
+      "issue": "Short heading for this issue",
+      "consequence": "What happens if not resolved within 7 days",
+      "last_recorded": "DD Mon YYYY or a short fact reference"
+    }
+  ],
+  "decisions_required": [
+    {
+      "decision": "The specific decision needed",
+      "owner": "Party name and individual contact if known",
+      "deadline": "DD Mon YYYY or ASAP",
+      "delay_consequence": "What happens if this decision slips"
+    }
+  ],
+  "party_actions": [
+    {
+      "party": "Stakeholder name — e.g. Malomatia/Client, Daya Internal, KIC, Al Kashaf, Nabina Holding",
+      "contacts": "Name(s) and phone number(s) if present in the facts, else empty string",
+      "actions": "What they need to action, by when, and why it is on the critical path"
+    }
+  ],
+  "commercial_summary": [
+    {
+      "item": "Contract / IPC / PO / Variation item name",
+      "value_ref": "QAR amount or document reference",
+      "notes_risk": "Status and risk note",
+      "flagged": false
+    }
+  ]
 }
 
+Rules for specific fields:
+- progress_snapshot: always produce exactly 4 KPIs. color "green" = healthy/on-track, "red" = blocked/at-risk, "blue" = neutral progress figure.
+- timeline: chronological order, oldest first. status determines row colour in the document.
+- impact_assessment: order Critical first, then High, then Medium.
+- party_actions: only include parties that actually appear in the facts.
+- commercial_summary: set flagged=true for expired quotes, unsigned payment certificates, or unquantified variation risks. If no commercial data exists, return one row with item="No commercial data available", value_ref="", notes_risk="", flagged=false.
 No markdown fences, no explanation, no extra text. Return ONLY the JSON object.`;
 
 export async function handleReport(env, chatId, topic, project) {
@@ -517,25 +575,34 @@ export async function handleReport(env, chatId, topic, project) {
 
   const contextBlock = buildReportContextBlock(topic, label, selected, allFacts.length);
 
+  // Keep typing indicator alive every 4s for the full duration of the Claude call
   sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+  const typingInterval = setInterval(() => {
+    sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+  }, 4000);
 
-  const narrativeRes = await claudeFetch(CLAUDE_API, {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: SONNET_MODEL,
-      max_tokens: 3000,
-      system: `${REPORT_SYSTEM_PROMPT}${summaryContext}`,
-      messages: [{
-        role: "user",
-        content: `Topic: ${topic}\nProject: ${label}\n\n${contextBlock}`,
-      }],
-    }),
-  });
+  let narrativeRes;
+  try {
+    narrativeRes = await claudeFetch(CLAUDE_API, {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: SONNET_MODEL,
+        max_tokens: 8000,
+        system: `${REPORT_SYSTEM_PROMPT}${summaryContext}`,
+        messages: [{
+          role: "user",
+          content: `Topic: ${topic}\nProject: ${label}\n\n${contextBlock}`,
+        }],
+      }),
+    });
+  } finally {
+    clearInterval(typingInterval);
+  }
 
   if (!narrativeRes.ok) throw new Error(`Claude Sonnet report error: ${narrativeRes.status}`);
 
@@ -546,7 +613,10 @@ export async function handleReport(env, chatId, topic, project) {
     const codeBlock = raw.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
     json = JSON.parse(codeBlock ? codeBlock[1] : (extractFirstJsonObject(raw) ?? raw));
   } catch {
-    throw new Error("Claude returned invalid JSON for report");
+    const raw = narrativeData.content[0]?.text ?? "(empty)";
+    const stopReason = narrativeData.stop_reason ?? "unknown";
+    console.error(`Report JSON parse failed. stop_reason=${stopReason} length=${raw.length} preview=${raw.slice(-200)}`);
+    throw new Error(`Claude returned invalid JSON for report (stop_reason: ${stopReason})`);
   }
 
   return { text: formatReportText(topic, label, json), json };
@@ -566,14 +636,14 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
     },
     body: JSON.stringify({
       model: SONNET_MODEL,
-      max_tokens: 3000,
+      max_tokens: 4000,
       messages: [{
         role: "user",
         content:
-          `You wrote this issue report for project "${label}", topic "${topic}":\n` +
+          `You wrote this project status report for project "${label}", topic "${topic}":\n` +
           `${JSON.stringify(originalJson, null, 2)}\n\n` +
           `Please revise it based on this feedback: ${feedback}\n\n` +
-          `Return ONLY the revised JSON with the same structure, including executive_summary, background, narrative, evidence, timeline, impact, recommendations, and conclusion fields.`,
+          `Return ONLY the revised JSON with the same structure, including all fields: header, progress_snapshot, executive_summary, timeline, impact_assessment, decisions_required, party_actions, and commercial_summary.`,
       }],
     }),
   });
@@ -657,54 +727,55 @@ function formatSummaryText(label, json, generatedAt = null) {
 }
 
 function formatReportText(topic, label, json) {
+  const h = json.header || {};
+  const statusEmoji = {
+    "On Track": "🟢", "At Risk": "🟡", "Delayed": "🔴",
+  }[h.status] ?? "📋";
+
   const parts = [
-    `📋 <b>Issue Report: ${escHtml(topic)}</b>`,
-    `Project: ${escHtml(label)}`,
+    `📋 <b>${escHtml(topic)}</b>`,
+    `Project: <b>${escHtml(label)}</b>   ${statusEmoji} ${escHtml(h.status || "")}`,
+    `Date: ${escHtml(h.date || "")}`,
     "",
-    `<b>Executive Summary:</b>`,
+    `<b>Executive Summary</b>`,
     escHtml(json.executive_summary || ""),
     "",
-    `<b>Background:</b>`,
-    escHtml(json.background || ""),
-    "",
-    `<b>Issue Narrative:</b>`,
-    escHtml(json.narrative || ""),
+    `<b>Timeline of Events</b>`,
+    escHtml(json.timeline_narrative || ""),
     "",
   ];
 
-  if (json.evidence?.length > 0) {
-    parts.push(`📧 <b>Evidence (${json.evidence.length} emails):</b>`);
-    for (const e of json.evidence) {
-      parts.push(`• [${escHtml(e.date || "")}] ${escHtml(e.sender || "")} — "<i>${escHtml(e.subject || "")}</i>"`);
-      parts.push(`  "${escHtml(e.excerpt || "")}"`);
-      parts.push(`  → ${escHtml(e.attribution || "")}`);
+  if (json.impact_assessment?.length > 0) {
+    parts.push(`<b>Current Impact Assessment</b>`);
+    for (const item of json.impact_assessment) {
+      const dot = item.severity === "Critical" ? "🔴" : item.severity === "High" ? "🟠" : "🟡";
+      parts.push(`${dot} <b>${escHtml(item.issue || "")}</b>`);
+      parts.push(escHtml(item.detail || ""));
+      parts.push("");
     }
-    parts.push("");
   }
 
-  if (json.timeline?.length > 0) {
-    parts.push(`📅 <b>Timeline:</b>`);
-    for (const t of json.timeline) {
-      parts.push(`• ${escHtml(t.date || "")} — ${escHtml(t.event || "")}`);
-      if (t.significance) parts.push(`  <i>${escHtml(t.significance)}</i>`);
-    }
-    parts.push("");
-  }
-
-  parts.push(`<b>Impact:</b>`);
-  parts.push(escHtml(json.impact || ""));
-  parts.push("");
-
-  if (json.recommendations?.length > 0) {
-    parts.push(`💡 <b>Recommendations:</b>`);
-    json.recommendations.forEach((r, i) => {
-      parts.push(`${i + 1}. ${escHtml(r)}`);
+  if (json.decisions_required?.length > 0) {
+    parts.push(`<b>Decisions Required</b>`);
+    json.decisions_required.forEach((d, i) => {
+      parts.push(`${i + 1}. ${escHtml(d.decision || "")}`);
+      parts.push(`   Owner: <b>${escHtml(d.owner || "")}</b> — By: <b>${escHtml(d.deadline || "")}</b>`);
+      parts.push(`   If delayed: ${escHtml(d.delay_consequence || "")}`);
     });
     parts.push("");
   }
 
-  parts.push(`<b>Conclusion:</b>`);
-  parts.push(escHtml(json.conclusion || ""));
+  if (json.party_actions?.length > 0) {
+    parts.push(`<b>Required Actions by Party</b>`);
+    for (const pa of json.party_actions) {
+      parts.push(`<b>${escHtml(pa.party || "")}</b>`);
+      parts.push(escHtml(pa.actions || ""));
+      parts.push("");
+    }
+  }
+
+  parts.push(`<b>Commercial Summary</b>`);
+  parts.push(escHtml(json.commercial_summary || ""));
   parts.push("");
   parts.push(`<i>Without Prejudice — Daya Interior Design</i>`);
 
@@ -976,7 +1047,7 @@ export async function handleTimeline(env, project, topic) {
     },
     body: JSON.stringify({
       model: HAIKU_MODEL,
-      max_tokens: 1200,
+      max_tokens: 3000,
       system: TIMELINE_SYSTEM_PROMPT,
       messages: [{
         role: "user",
@@ -1001,6 +1072,7 @@ export async function handleTimeline(env, project, topic) {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
     json = JSON.parse(extractFirstJsonObject(cleaned) ?? cleaned);
   } catch {
+    console.error("Timeline JSON parse failed. Raw response:", raw.slice(0, 600));
     throw new Error("Claude returned invalid JSON for timeline");
   }
 

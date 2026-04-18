@@ -184,13 +184,24 @@ export async function claudeFetch(url, options) {
       await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
       continue;
     }
-    // 429 = rate limited; 5xx (including 529 = overloaded) = server error — all retryable
-    const shouldRetry = res.status === 429 || res.status >= 500;
+    // 429 = rate limited; 5xx (including 529 = overloaded) = server error — all retryable.
+    // 403 with Cloudflare error code 1000 is a transient CF edge routing failure
+    // (api.anthropic.com is Cloudflare-fronted; CF Workers occasionally intercept
+    // the request and return an "error code: 1000 / DNS points to prohibited IP"
+    // page before it reaches Anthropic). Retry these the same as network errors.
+    let shouldRetry = res.status === 429 || res.status >= 500;
+    if (!shouldRetry && res.status === 403) {
+      const body = await res.clone().text();
+      if (body.includes("error code: 1000")) {
+        console.warn(`Cloudflare edge error 1000 on attempt ${attempt + 1}/3 — retrying`);
+        shouldRetry = true;
+      }
+    }
     if (!shouldRetry) break;
     if (attempt === 2) break; // exhausted retries — fall through to caller
     const waitMs = res.status === 429
       ? Math.min(parseInt(res.headers.get("retry-after") || "5", 10), 10) * 1000
-      : Math.pow(2, attempt) * 1000; // 1s, 2s exponential for 5xx
+      : Math.pow(2, attempt) * 1000; // 1s, 2s exponential for 5xx / CF errors
     console.warn(`Claude ${res.status}, retrying in ${waitMs / 1000}s... (attempt ${attempt + 1}/3)`);
     await new Promise(r => setTimeout(r, waitMs));
   }

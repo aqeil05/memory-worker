@@ -292,7 +292,46 @@ export async function uploadReport(env, filename, fileBytes) {
   }
 
   const file = await res.json();
-  return file.webUrl;
+  return { webUrl: file.webUrl, id: file.id };
+}
+
+// ── Download an OneDrive item as PDF (MS Graph format conversion) ─────────────
+
+export async function downloadItemAsPdf(env, itemId) {
+  const token = await getAccessToken(env);
+  const url = `${GRAPH_BASE}/users/${encodeURIComponent(env.ONEDRIVE_USER_EMAIL)}/drive/items/${encodeURIComponent(itemId)}/content?format=pdf`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`PDF conversion failed: ${res.status} ${body}`);
+  }
+  const buf = await res.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+// ── Upload a PDF file to OneDrive/Memory Worker/Reports/ ─────────────────────
+
+export async function uploadPdfReport(env, filename, pdfBytes) {
+  const token = await getAccessToken(env);
+  const reportPath = `Memory Worker/Reports/${filename}`;
+  const uploadUrl = `${driveRoot(env.ONEDRIVE_USER_EMAIL)}:/${encodeURIComponent(reportPath)}:/content`;
+
+  const res = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/pdf",
+    },
+    body: pdfBytes,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`uploadPdfReport failed: ${res.status} ${body}`);
+  }
+
+  const file = await res.json();
+  return { webUrl: file.webUrl };
 }
 
 // ── Export all KV facts to OneDrive Excel (call GET /export-excel) ────────────

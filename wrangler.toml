@@ -8,7 +8,7 @@ binding = "DAYA_KV"
 id = "7d313eeaaa5d4a50b3f779f9e0c7f180"
 
 [triggers]
-crons = ["0 */12 * * *", "0 3 * * *"]
+crons = ["0 */12 * * *", "0 1 * * *", "0 3 * * *"]
 
 [[queues.producers]]
 queue = "daya-email-queue"
@@ -19,6 +19,15 @@ queue = "daya-email-queue"
 max_batch_size = 5
 max_batch_timeout = 10
 max_retries = 3
+
+[[queues.producers]]
+queue = "daya-report-queue"
+binding = "REPORT_QUEUE"
+
+[[queues.consumers]]
+queue = "daya-report-queue"
+max_batch_size = 1
+max_retries = 1
 
 [vars]
 TELEGRAM_MEMORY_BOT_USERNAME = "DayaProjectBot"
