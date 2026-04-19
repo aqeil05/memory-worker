@@ -543,6 +543,57 @@ Rules for specific fields:
 - commercial_summary: set flagged=true for expired quotes, unsigned payment certificates, or unquantified variation risks. If no commercial data exists, return one row with item="No commercial data available", value_ref="", notes_risk="", flagged=false.
 No markdown fences, no explanation, no extra text. Return ONLY the JSON object.`;
 
+// Pre-process the user's report topic with Haiku to expand keywords and define scope.
+// Returns { expandedKeywords, scopeNote, focusAreas } or null on failure (caller falls back).
+async function expandReportTopic(env, topic, allFacts) {
+  try {
+    // Sample up to 60 unique subjects from facts so Haiku understands project vocabulary
+    const subjects = [...new Set(allFacts.map(f => f.subject).filter(Boolean))].slice(0, 60);
+    const subjectList = subjects.length > 0 ? `\nProject email subjects (vocabulary reference):\n${subjects.map(s => `• ${s}`).join("\n")}` : "";
+
+    const res = await claudeFetch(CLAUDE_API, {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: HAIKU_MODEL,
+        max_tokens: 400,
+        system: `You are a search query expander for a construction/interior design project memory system.
+Given a report topic, output a JSON object with:
+- expanded_keywords: array of 8-15 search terms including synonyms, abbreviations, related concepts, and domain-specific terms that might appear in project emails
+- scope_note: one sentence clarifying what this report should focus on
+- focus_areas: array of 3-5 specific aspects the report should investigate
+Return ONLY valid JSON. No markdown, no explanation.`,
+        messages: [{
+          role: "user",
+          content: `Report topic: "${topic}"${subjectList}`,
+        }],
+      }),
+    });
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    const raw = data.content?.[0]?.text?.trim();
+    if (!raw) return null;
+
+    const parsed = JSON.parse(extractFirstJsonObject(raw) ?? raw);
+    if (!Array.isArray(parsed.expanded_keywords) || !parsed.scope_note) return null;
+
+    console.log(`expandReportTopic: expanded "${topic}" → [${parsed.expanded_keywords.join(", ")}]`);
+    return {
+      expandedKeywords: parsed.expanded_keywords.map(k => String(k).toLowerCase()),
+      scopeNote: parsed.scope_note,
+      focusAreas: Array.isArray(parsed.focus_areas) ? parsed.focus_areas : [],
+    };
+  } catch (err) {
+    console.warn(`expandReportTopic failed (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
 export async function handleReport(env, chatId, topic, project) {
   const { company, label } = project;
 
@@ -551,8 +602,11 @@ export async function handleReport(env, chatId, topic, project) {
     return { text: `📋 No facts recorded yet for this project.`, json: null };
   }
 
+  // Preprocessing: expand topic keywords with Haiku for better fact selection
+  const expansion = await expandReportTopic(env, topic, allFacts);
+
   // Select relevant facts using thread-based scoring (same as Q&A, broader budget)
-  const selected = selectRelevantFacts(allFacts, topic, REPORT_MAX_SHORTLIST);
+  const selected = selectRelevantFacts(allFacts, topic, REPORT_MAX_SHORTLIST, expansion?.expandedKeywords ?? null);
 
   if (selected.length < 3) {
     return {
@@ -573,6 +627,13 @@ export async function handleReport(env, chatId, topic, project) {
     summaryContext = `\n\n=== Project Context (generated ${cachedSummary.generatedAt || "recently"}) ===\n${parts.join("\n\n")}`;
   }
 
+  // Inject AI-expanded scope into system prompt if preprocessing succeeded
+  let scopeContext = "";
+  if (expansion) {
+    const areas = expansion.focusAreas.length > 0 ? `\nKey focus areas: ${expansion.focusAreas.join(", ")}` : "";
+    scopeContext = `\n\n=== Report Scope ===\n${expansion.scopeNote}${areas}`;
+  }
+
   const contextBlock = buildReportContextBlock(topic, label, selected, allFacts.length);
 
   // Keep typing indicator alive every 4s for the full duration of the Claude call
@@ -581,6 +642,8 @@ export async function handleReport(env, chatId, topic, project) {
     sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
   }, 4000);
 
+  // Use streaming to avoid Cloudflare's outbound fetch timeout on long Sonnet responses.
+  // With stream:true Anthropic sends tokens incrementally, keeping the connection alive.
   let narrativeRes;
   try {
     narrativeRes = await claudeFetch(CLAUDE_API, {
@@ -593,29 +656,60 @@ export async function handleReport(env, chatId, topic, project) {
       body: JSON.stringify({
         model: SONNET_MODEL,
         max_tokens: 8000,
-        system: `${REPORT_SYSTEM_PROMPT}${summaryContext}`,
+        stream: true,
+        system: `${REPORT_SYSTEM_PROMPT}${summaryContext}${scopeContext}`,
         messages: [{
           role: "user",
           content: `Topic: ${topic}\nProject: ${label}\n\n${contextBlock}`,
         }],
       }),
     });
+  } catch (err) {
+    clearInterval(typingInterval);
+    throw err;
+  }
+
+  if (!narrativeRes.ok) {
+    clearInterval(typingInterval);
+    throw new Error(`Claude Sonnet report error: ${narrativeRes.status}`);
+  }
+
+  // Read SSE stream and accumulate the full text
+  let rawText = "";
+  let stopReason = "unknown";
+  try {
+    const reader = narrativeRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep incomplete last line for next chunk
+      for (const line of lines) {
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        try {
+          const event = JSON.parse(line.slice(6));
+          if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+            rawText += event.delta.text;
+          } else if (event.type === "message_delta" && event.delta?.stop_reason) {
+            stopReason = event.delta.stop_reason;
+          }
+        } catch { /* malformed SSE line — skip */ }
+      }
+    }
   } finally {
     clearInterval(typingInterval);
   }
 
-  if (!narrativeRes.ok) throw new Error(`Claude Sonnet report error: ${narrativeRes.status}`);
-
-  const narrativeData = await narrativeRes.json();
   let json;
   try {
-    const raw = narrativeData.content[0].text.trim();
+    const raw = rawText.trim();
     const codeBlock = raw.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
     json = JSON.parse(codeBlock ? codeBlock[1] : (extractFirstJsonObject(raw) ?? raw));
   } catch {
-    const raw = narrativeData.content[0]?.text ?? "(empty)";
-    const stopReason = narrativeData.stop_reason ?? "unknown";
-    console.error(`Report JSON parse failed. stop_reason=${stopReason} length=${raw.length} preview=${raw.slice(-200)}`);
+    console.error(`Report JSON parse failed. stop_reason=${stopReason} length=${rawText.length} preview=${rawText.slice(-200)}`);
     throw new Error(`Claude returned invalid JSON for report (stop_reason: ${stopReason})`);
   }
 
@@ -637,6 +731,7 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
     body: JSON.stringify({
       model: SONNET_MODEL,
       max_tokens: 4000,
+      stream: true,
       messages: [{
         role: "user",
         content:
@@ -650,11 +745,31 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
 
   if (!res.ok) throw new Error(`Claude regenerate error: ${res.status}`);
 
-  const data = await res.json();
+  let rawText = "";
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+      try {
+        const event = JSON.parse(line.slice(6));
+        if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+          rawText += event.delta.text;
+        }
+      } catch { /* skip malformed SSE line */ }
+    }
+  }
+
   let json;
   try {
-    const extracted = extractFirstJsonObject(data.content[0].text.trim());
-    json = JSON.parse(extracted ?? data.content[0].text.trim());
+    const extracted = extractFirstJsonObject(rawText.trim());
+    json = JSON.parse(extracted ?? rawText.trim());
   } catch {
     throw new Error("Claude returned invalid JSON for regenerated report");
   }
@@ -795,8 +910,8 @@ function extractKeywords(question) {
 // + recency, then fills the budget with complete threads in score order.
 // This keeps thread context intact (MOM 008's 6 facts arrive together, not split apart)
 // and handles temporal queries ("latest", "most recent") correctly via recency weighting.
-function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST) {
-  const keywords = extractKeywords(question);
+function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST, overrideKeywords = null) {
+  const keywords = overrideKeywords ?? extractKeywords(question);
   const isTemporalQuery = /\b(latest|most recent|last|recent|newest|current)\b/i.test(question);
   const now = Date.now();
 
