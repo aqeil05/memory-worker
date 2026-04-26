@@ -22,15 +22,21 @@ const INBOXES = [
 // ── Admin auth ────────────────────────────────────────────────────────────────
 // Returns a 401 Response if INTERNAL_SECRET is set and the request doesn't match.
 // If INTERNAL_SECRET is not configured, auth is skipped (open — set it in production).
+// Uses timing-safe comparison to prevent side-channel attacks.
 function requireSecret(request, env) {
   if (!env.INTERNAL_SECRET) return null;
   const auth = request.headers.get("Authorization") || "";
-  if (auth !== `Bearer ${env.INTERNAL_SECRET}`) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+  const expected = `Bearer ${env.INTERNAL_SECRET}`;
+  const reject = () => new Response(JSON.stringify({ error: "Unauthorized" }), {
+    status: 401,
+    headers: { "Content-Type": "application/json" },
+  });
+  if (auth.length !== expected.length) return reject();
+  const enc = new TextEncoder();
+  const a = enc.encode(auth);
+  const b = enc.encode(expected);
+  // crypto.subtle.timingSafeEqual available in Workers runtime
+  if (!crypto.subtle.timingSafeEqual(a, b)) return reject();
   return null;
 }
 

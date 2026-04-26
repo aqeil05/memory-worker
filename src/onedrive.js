@@ -94,7 +94,6 @@ export async function appendFacts(env, factRows) {
       console.warn(`appendFacts: project "${company}" now has ${merged.length} facts — consider archiving old data`);
     }
     await env.DAYA_KV.put(key, JSON.stringify(merged));
-    await env.DAYA_KV.put(`mem:dirty:${company}`, "1");
     await trackCompany(env, company);
   }
 }
@@ -121,6 +120,7 @@ export async function mergeCompany(env, from, into) {
     env.DAYA_KV.delete(`mem:facts:${from}`),
     env.DAYA_KV.delete(`mem:co:${from}`),
     env.DAYA_KV.delete(`summary:cache:${from}`),
+    env.DAYA_KV.delete(COMPANY_LIST_CACHE_KEY), // Invalidate cached company list
   ]);
   const failed = deleteResults.filter(r => r.status === "rejected");
   if (failed.length > 0) {
@@ -227,19 +227,35 @@ export async function getAllProjectFacts(env, company) {
 // array. KV put is idempotent — eliminates the read-check-write race condition
 // that caused duplicates when two emails for a new company were processed concurrently.
 
+const COMPANY_LIST_CACHE_KEY = "mem:companies:list";
+const COMPANY_LIST_CACHE_TTL = 60; // 60 seconds
+
 async function trackCompany(env, company) {
   await env.DAYA_KV.put(`mem:co:${company}`, "1");
+  // Invalidate cached company list so next read picks up the new company
+  await env.DAYA_KV.delete(COMPANY_LIST_CACHE_KEY);
 }
 
 export async function getAllCompanies(env) {
+  // Check short-lived cache first to avoid repeated KV list scans
+  const cached = await env.DAYA_KV.get(COMPANY_LIST_CACHE_KEY, "json");
+  if (cached) return cached;
+
   // Try the fast company index first
   const coList = await env.DAYA_KV.list({ prefix: "mem:co:" });
+  let companies;
   if (coList.keys.length > 0) {
-    return coList.keys.map(k => k.name.slice("mem:co:".length));
+    companies = coList.keys.map(k => k.name.slice("mem:co:".length));
+  } else {
+    // Fallback: scan mem:facts: directly (handles missing index)
+    const factsList = await env.DAYA_KV.list({ prefix: "mem:facts:" });
+    companies = factsList.keys.map(k => k.name.slice("mem:facts:".length));
   }
-  // Fallback: scan mem:facts: directly (handles missing index)
-  const factsList = await env.DAYA_KV.list({ prefix: "mem:facts:" });
-  return factsList.keys.map(k => k.name.slice("mem:facts:".length));
+
+  // Cache for 60s — trackCompany invalidates on new additions
+  await env.DAYA_KV.put(COMPANY_LIST_CACHE_KEY, JSON.stringify(companies),
+    { expirationTtl: COMPANY_LIST_CACHE_TTL });
+  return companies;
 }
 
 // ── Active project list ───────────────────────────────────────────────────────

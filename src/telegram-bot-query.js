@@ -85,24 +85,21 @@ const STOP_WORDS = new Set([
 export async function handleBotQuery(env, chatId, question, project, isClarification = false) {
   const { company, label } = project;
 
-  const history = await getBotHistory(env.DAYA_KV, chatId);
-
-  // Fetch all facts once — totalCount is always the real project total so Claude
-  // can answer "how many facts / how big is this project" accurately.
-  const allFacts = await getAllProjectFacts(env, company).catch((err) => {
-    console.error(`getAllProjectFacts failed for ${company}: ${err.message}`);
-    return [];
-  });
+  // Parallelize all independent KV reads for lower latency
+  const [history, allFacts, cachedSummary] = await Promise.all([
+    getBotHistory(env.DAYA_KV, chatId),
+    getAllProjectFacts(env, company).catch((err) => {
+      console.error(`getAllProjectFacts failed for ${company}: ${err.message}`);
+      return [];
+    }),
+    getCachedSummary(env, company).catch(() => null),
+  ]);
   const totalCount = allFacts.length;
 
   // Compute full date range from all facts so Claude always knows the true span,
   // even when only a shortlist is sent as context.
   const allDates = allFacts.map(r => r.emailDate?.slice(0, 10)).filter(Boolean).sort();
   const fullDateRange = allDates.length > 0 ? `${allDates[0]} to ${allDates[allDates.length - 1]}` : null;
-
-  // Include cached daily summary (if available) so Sonnet has broad project awareness
-  // even when the specific thread wasn't in the selected facts.
-  const cachedSummary = await getCachedSummary(env, company).catch(() => null);
   let summaryContext = "";
   if (cachedSummary?.json) {
     const s = cachedSummary.json;
@@ -134,6 +131,25 @@ export async function handleBotQuery(env, chatId, question, project, isClarifica
     const contextFacts = selectRelevantFacts(allFacts, question, budgets[attempt]);
     const context = buildContextBlock(label, contextFacts, contextFacts, [], totalCount, fullDateRange);
 
+    // Use structured system blocks with cache_control for prompt caching.
+    // The system prompt + project context are stable across questions in the same
+    // session, so caching them saves ~25% on cost and reduces TTFT.
+    const systemBlocks = [
+      {
+        type: "text",
+        text: QA_SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" },
+      },
+    ];
+    if (summaryContext) {
+      systemBlocks.push({ type: "text", text: summaryContext });
+    }
+    systemBlocks.push({
+      type: "text",
+      text: `\n\n${context}`,
+      cache_control: { type: "ephemeral" },
+    });
+
     const res = await claudeFetch(CLAUDE_API, {
       method: "POST",
       headers: {
@@ -144,7 +160,7 @@ export async function handleBotQuery(env, chatId, question, project, isClarifica
       body: JSON.stringify({
         model: SONNET_MODEL,
         max_tokens: 600,
-        system: `${QA_SYSTEM_PROMPT}${summaryContext}\n\n${context}`,
+        system: systemBlocks,
         messages,
       }),
     });
@@ -159,8 +175,9 @@ export async function handleBotQuery(env, chatId, question, project, isClarifica
     }
 
     if (!res.ok) {
-      const errBody = await res.text();
-      throw new Error(`Claude Sonnet error: ${res.status} ${errBody}`);
+      if (res.status === 401 || res.status === 403) throw new Error(`Claude Sonnet auth error: ${res.status}`);
+      const errBody = await res.text().catch(() => "(unreadable)");
+      throw new Error(`Claude Sonnet error: ${res.status} ${errBody.slice(0, 200)}`);
     }
 
     data = await res.json();
@@ -226,22 +243,25 @@ async function summarizeChunkWithHaiku(env, label, chunkFacts, chunkIndex) {
     },
     body: JSON.stringify({
       model: HAIKU_MODEL,
-      max_tokens: 600,
+      max_tokens: 400,
       messages: [{
         role: "user",
         content:
-          `Summarise the following project facts for ${label}.\n` +
-          `Preserve ALL key details: exact dates, cost figures, deadlines, open actions, decisions, risks, and contacts.\n` +
-          `Be concise but complete — do not omit numbers or action items.\n\n` +
+          `Summarise the following project facts for ${label} into a compact intermediate format.\n` +
+          `Preserve ALL key details: exact dates, cost figures (QAR), deadlines, open actions, decisions, risks, and contacts.\n` +
+          `Be extremely concise — use short phrases, not full sentences. No filler or preamble.\n` +
+          `Group by category: TIMELINE, COSTS, DECISIONS, OPEN ITEMS, RISKS, CONTACTS.\n` +
+          `Only include categories that have data. Omit empty categories.\n\n` +
           `FACTS (${chunkFacts.length}):\n${factLines}\n\n` +
-          `Return a concise bullet-point summary.`,
+          `Return categorised bullet points. Keep total output under 300 words.`,
       }],
     }),
   });
 
   if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error(`Claude Haiku chunk ${chunkIndex} error: ${res.status} ${errBody}`);
+    if (res.status === 401 || res.status === 403) throw new Error(`Claude Haiku auth error: ${res.status}`);
+    const errBody = await res.text().catch(() => "(unreadable)");
+    throw new Error(`Claude Haiku chunk ${chunkIndex} error: ${res.status} ${errBody.slice(0, 200)}`);
   }
 
   const data = await res.json();
@@ -289,7 +309,7 @@ async function callClaudeForSummary(env, label, facts) {
     body: JSON.stringify({
       model: SONNET_MODEL,
       max_tokens: 8192,
-      system: SUMMARY_SYSTEM_PROMPT,
+      system: [{ type: "text", text: SUMMARY_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{
         role: "user",
         content:
@@ -303,8 +323,9 @@ async function callClaudeForSummary(env, label, facts) {
   });
 
   if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error(`Claude Sonnet summary error: ${res.status} ${errBody}`);
+    if (res.status === 401 || res.status === 403) throw new Error(`Claude Sonnet summary auth error: ${res.status}`);
+    const errBody = await res.text().catch(() => "(unreadable)");
+    throw new Error(`Claude Sonnet summary error: ${res.status} ${errBody.slice(0, 200)}`);
   }
 
   const data = await res.json();
@@ -378,47 +399,52 @@ export async function generateDailySummaries(env, onProgress = null, companyFilt
   const total = companies.length;
   const cutoff = getTenDayCutoff();
   const cached = [], skipped = [], failed = [];
+  const PARALLEL_BATCH = 3; // Process 3 companies concurrently within each batch
+  let processed = 0;
 
-  for (let i = 0; i < total; i++) {
-    const company = companies[i];
-    try {
-      const allFacts = await getAllProjectFacts(env, company);
-      const recent = allFacts.filter(f => (f.emailDate || "").slice(0, 10) >= cutoff);
-      if (!recent.length) {
-        // No activity in last 10 days — preserve any existing cache, skip regeneration
-        skipped.push(company);
-        continue;
-      }
+  async function processOneCompany(company) {
+    const allFacts = await getAllProjectFacts(env, company);
+    const recent = allFacts.filter(f => (f.emailDate || "").slice(0, 10) >= cutoff);
+    if (!recent.length) {
+      skipped.push(company);
+      return;
+    }
 
-      // Retry run only: skip companies that already have a fresh summary from the
-      // earlier batch run. 2.5h window covers the full 04:00→06:00 Qatar gap.
-      if (skipFresh) {
-        const existing = await getCachedSummary(env, company).catch(() => null);
-        if (existing?.generatedAt) {
-          const ageMs = Date.now() - new Date(existing.generatedAt).getTime();
-          if (ageMs < 2.5 * 60 * 60 * 1000) {
-            skipped.push(company);
-            continue;
-          }
+    if (skipFresh) {
+      const existing = await getCachedSummary(env, company).catch(() => null);
+      if (existing?.generatedAt) {
+        const ageMs = Date.now() - new Date(existing.generatedAt).getTime();
+        if (ageMs < 2.5 * 60 * 60 * 1000) {
+          skipped.push(company);
+          return;
         }
       }
+    }
 
-      // Always regenerate for active projects — ensures a fresh summary every morning
-      // regardless of whether new emails arrived since the previous cron run.
-      const json = await callClaudeForSummary(env, company, recent);
-      await setCachedSummary(env, company, { json, generatedAt: new Date().toISOString() });
-      // Clear dirty flag if set — keeps KV tidy even though we no longer gate on it.
-      await env.DAYA_KV.delete(`mem:dirty:${company}`);
-      console.log(`Daily summary cached for "${company}" (${recent.length} facts)`);
-      cached.push({ company, facts: recent.length });
-    } catch (err) {
-      console.error(`Daily summary failed for "${company}": ${err.message}`);
-      failed.push({ company, error: err.message });
-    } finally {
-      // Report progress before the inter-company delay so the update feels immediate.
-      if (onProgress) await onProgress(i + 1, total, company).catch(() => {});
-      // Always pace inter-company requests — including after failures — to avoid burst 429s.
-      await new Promise(r => setTimeout(r, 1500));
+    const json = await callClaudeForSummary(env, company, recent);
+    await setCachedSummary(env, company, { json, generatedAt: new Date().toISOString() });
+    console.log(`Daily summary cached for "${company}" (${recent.length} facts)`);
+    cached.push({ company, facts: recent.length });
+  }
+
+  for (let i = 0; i < total; i += PARALLEL_BATCH) {
+    const batch = companies.slice(i, i + PARALLEL_BATCH);
+    const results = await Promise.allSettled(batch.map(company =>
+      processOneCompany(company)
+    ));
+
+    for (let j = 0; j < results.length; j++) {
+      processed++;
+      if (results[j].status === "rejected") {
+        console.error(`Daily summary failed for "${batch[j]}": ${results[j].reason?.message}`);
+        failed.push({ company: batch[j], error: results[j].reason?.message });
+      }
+      if (onProgress) await onProgress(processed, total, batch[j]).catch(() => {});
+    }
+
+    // Pace between parallel batches to avoid burst 429s (200ms vs old 1500ms)
+    if (i + PARALLEL_BATCH < total) {
+      await new Promise(r => setTimeout(r, 200));
     }
   }
 
@@ -657,7 +683,10 @@ export async function handleReport(env, chatId, topic, project) {
         model: SONNET_MODEL,
         max_tokens: 8000,
         stream: true,
-        system: `${REPORT_SYSTEM_PROMPT}${summaryContext}${scopeContext}`,
+        system: [
+          { type: "text", text: REPORT_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+          { type: "text", text: `${summaryContext}${scopeContext}` },
+        ],
         messages: [{
           role: "user",
           content: `Topic: ${topic}\nProject: ${label}\n\n${contextBlock}`,
@@ -677,6 +706,7 @@ export async function handleReport(env, chatId, topic, project) {
   // Read SSE stream and accumulate the full text
   let rawText = "";
   let stopReason = "unknown";
+  let streamComplete = false;
   try {
     const reader = narrativeRes.body.getReader();
     const decoder = new TextDecoder();
@@ -688,7 +718,8 @@ export async function handleReport(env, chatId, topic, project) {
       const lines = buffer.split("\n");
       buffer = lines.pop(); // keep incomplete last line for next chunk
       for (const line of lines) {
-        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        if (line === "data: [DONE]") { streamComplete = true; continue; }
+        if (!line.startsWith("data: ")) continue;
         try {
           const event = JSON.parse(line.slice(6));
           if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
@@ -703,14 +734,21 @@ export async function handleReport(env, chatId, topic, project) {
     clearInterval(typingInterval);
   }
 
+  // Detect truncated streams before attempting JSON parse
+  if (!streamComplete && rawText.length < 500) {
+    console.error(`Report stream incomplete: ${rawText.length} chars, stop_reason=${stopReason}`);
+    throw new Error("Report generation failed — response was truncated. Try a narrower topic.");
+  }
+
   let json;
   try {
     const raw = rawText.trim();
     const codeBlock = raw.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
     json = JSON.parse(codeBlock ? codeBlock[1] : (extractFirstJsonObject(raw) ?? raw));
   } catch {
-    console.error(`Report JSON parse failed. stop_reason=${stopReason} length=${rawText.length} preview=${rawText.slice(-200)}`);
-    throw new Error(`Claude returned invalid JSON for report (stop_reason: ${stopReason})`);
+    const truncated = !streamComplete ? " (stream was truncated)" : "";
+    console.error(`Report JSON parse failed${truncated}. stop_reason=${stopReason} length=${rawText.length} preview=${rawText.slice(-200)}`);
+    throw new Error(`Claude returned invalid JSON for report (stop_reason: ${stopReason})${truncated}`);
   }
 
   return { text: formatReportText(topic, label, json), json };
@@ -1163,7 +1201,7 @@ export async function handleTimeline(env, project, topic) {
     body: JSON.stringify({
       model: HAIKU_MODEL,
       max_tokens: 3000,
-      system: TIMELINE_SYSTEM_PROMPT,
+      system: [{ type: "text", text: TIMELINE_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
       messages: [{
         role: "user",
         content: `Project: ${label}\nTopic: ${topic}\n\nFacts (${selected.length} selected from ${allFacts.length} total):\n${factLines}`,

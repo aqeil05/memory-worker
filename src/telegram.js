@@ -18,7 +18,7 @@
 
 import { handleBotQuery, handleSummary, handleReport, regenerateReport, handleTimeline } from "./telegram-bot-query.js";
 import { linkGroup, getGroupProject, uploadReport, downloadItemAsPdf, uploadPdfReport, matchingCompanies, getAllCompanies, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
-import { normalizeCompany, setAlias, listAliases } from "./memory.js";
+import { normalizeCompany, isValidCompanyName, setAlias, listAliases } from "./memory.js";
 import { buildSummaryDocx, buildReportDocx } from "./docx.js";
 import {
   getBotPending, setBotPending, deleteBotPending,
@@ -1125,6 +1125,13 @@ async function handleLink(env, chatId, text) {
       `<b>Available projects (${companies.length}):</b>\n${companyList}\n\n` +
       "Example: <code>/link Malomatia 19th Floor</code>"
     );
+    return;
+  }
+
+  // Validate company name before any processing
+  if (!isValidCompanyName(label)) {
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      "⚠️ Invalid project name — only letters, numbers, spaces, and basic punctuation are allowed.");
     return;
   }
 

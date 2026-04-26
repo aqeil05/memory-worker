@@ -19,6 +19,7 @@ queue = "daya-email-queue"
 max_batch_size = 5
 max_batch_timeout = 10
 max_retries = 3
+max_concurrency = 1  # Serialize processing to prevent KV race in appendFacts (read-modify-write)
 
 [[queues.producers]]
 queue = "daya-report-queue"
