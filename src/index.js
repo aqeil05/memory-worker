@@ -6,7 +6,7 @@
 //   - Handles Closed Won project setup links
 
 import { handleEmailWebhook, backfillEmails, processEmail } from "./email-handler.js";
-import { handleTelegramUpdate, runReportTask } from "./telegram.js";
+import { handleTelegramUpdate, runReportTask, runRefineTask } from "./telegram.js";
 import { registerSubscription, renewSubscriptions } from "./graph.js";
 import { setupWorkbook, exportToExcel, getAllCompanies, appendFacts, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
 import { generateDailySummaries, handleReport } from "./telegram-bot-query.js";
@@ -213,8 +213,12 @@ export default {
     // so it never throws — always ack, never retry.
     if (batch.queue === "daya-report-queue") {
       for (const msg of batch.messages) {
-        const { chatId, topic, project } = msg.body;
-        await runReportTask(env, chatId, topic, project);
+        const body = msg.body;
+        if (body.type === "refine") {
+          await runRefineTask(env, body);
+        } else {
+          await runReportTask(env, body.chatId, body.topic, body.project);
+        }
         msg.ack();
       }
       return;

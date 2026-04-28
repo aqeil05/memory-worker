@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Daya App Mockup</title>
+<style>
+  @page { size: A3 landscape; margin: 20mm; }
+  @media print {
+    body { padding: 0 !important; gap: 0 !important; background: #1a1a2e !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .row { page-break-after: always; padding: 20px 0; gap: 48px !important; }
+    .row:last-child { page-break-after: avoid; }
+    h2.section { display: none; }
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:-apple-system,'Segoe UI',sans-serif;
+    background:linear-gradient(135deg,#1a1a2e 0%,#2d2d44 100%);
+    min-height:100vh;
+    display:flex;flex-direction:column;
+    align-items:center;padding:40px 20px 60px;
+    gap:48px;
+  }
+  h2.section{
+    color:#C8A96E;font-size:13px;font-weight:700;
+    text-transform:uppercase;letter-spacing:1px;
+    align-self:flex-start;margin-left:calc(50% - 760px/2);
+  }
+  .row{display:flex;gap:32px;justify-content:center;flex-wrap:wrap}
+
+  /* Phone shell */
+  .wrap{display:flex;flex-direction:column;align-items:center;gap:10px}
+  .lbl{color:#aaa;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+  .phone{
+    width:300px;height:620px;
+    background:#111;border-radius:36px;
+    padding:10px;
+    box-shadow:0 24px 64px rgba(0,0,0,.5),inset 0 0 0 1px #333;
+    position:relative;flex-shrink:0;
+  }
+  .phone::before{
+    content:'';position:absolute;
+    top:16px;left:50%;transform:translateX(-50%);
+    width:72px;height:5px;
+    background:#2a2a2a;border-radius:3px;z-index:10;
+  }
+  .screen{
+    width:100%;height:100%;
+    border-radius:28px;overflow:hidden;
+    background:#f7f7f7;
+    display:flex;flex-direction:column;
+  }
+
+  /* Status bar */
+  .sb{
+    height:26px;background:#fff;
+    display:flex;align-items:center;
+    justify-content:space-between;
+    padding:0 14px;font-size:10px;font-weight:600;color:#222;flex-shrink:0;
+  }
+  .sb .icons{display:flex;gap:3px;font-size:9px}
+
+  /* ─── SCREEN 1: Mode Select ─── */
+  .mode-screen{background:#fff;flex:1;display:flex;flex-direction:column}
+  .mode-hero{
+    padding:20px 18px 14px;
+    background:linear-gradient(160deg,#1a1a2e,#3a3060);
+    flex-shrink:0;
+  }
+  .mode-hero .greeting{font-size:11px;color:rgba(255,255,255,.5);margin-bottom:3px}
+  .mode-hero h1{font-size:20px;font-weight:700;color:#fff}
+  .mode-hero .sub{font-size:11px;color:#C8A96E;margin-top:2px}
+  .notif-row{
+    display:flex;align-items:center;gap:8px;
+    background:rgba(255,255,255,.08);
+    border-radius:10px;padding:8px 11px;margin-top:12px;
+  }
+  .notif-dot{width:7px;height:7px;background:#C8A96E;border-radius:50%;flex-shrink:0}
+  .notif-text{font-size:10px;color:rgba(255,255,255,.8);flex:1;line-height:1.4}
+  .notif-time{font-size:9px;color:rgba(255,255,255,.35)}
+
+  .mode-cards{padding:14px;display:flex;flex-direction:column;gap:12px}
+  .mode-card{
+    border-radius:16px;padding:16px 16px;
+    display:flex;align-items:center;gap:14px;
+    cursor:pointer;position:relative;overflow:hidden;
+  }
+  .mode-card.pm{background:linear-gradient(135deg,#FFF7EC,#FFF0D6);border:1px solid #E8D5B0}
+  .mode-card.ts{background:linear-gradient(135deg,#EEF4FF,#E0EAFF);border:1px solid #C0D4F5}
+  .mode-icon{
+    width:48px;height:48px;border-radius:14px;
+    display:flex;align-items:center;justify-content:center;
+    font-size:22px;flex-shrink:0;
+  }
+  .pm .mode-icon{background:#C8A96E22}
+  .ts .mode-icon{background:#5B73E822}
+  .mode-info h3{font-size:15px;font-weight:700}
+  .pm .mode-info h3{color:#7A5C2A}
+  .ts .mode-info h3{color:#2A3D7A}
+  .mode-info p{font-size:11px;margin-top:2px}
+  .pm .mode-info p{color:#B08040}
+  .ts .mode-info p{color:#5B73E8}
+  .mode-arrow{margin-left:auto;font-size:18px;opacity:.4}
+
+  .quick-stats{
+    display:flex;gap:8px;padding:0 14px;flex-shrink:0;
+  }
+  .stat-chip{
+    flex:1;background:#fff;border:1px solid #eee;
+    border-radius:12px;padding:10px 10px;
+    display:flex;flex-direction:column;align-items:center;gap:2px;
+  }
+  .stat-num{font-size:18px;font-weight:700;color:#C8A96E}
+  .stat-lbl{font-size:9px;color:#999;text-align:center}
+
+  .recent-section{padding:12px 14px;flex:1;overflow:hidden}
+  .sec-hdr{font-size:11px;font-weight:700;color:#aaa;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+  .activity-item{
+    display:flex;align-items:flex-start;gap:10px;
+    padding:9px 0;border-bottom:1px solid #f2f2f2;
+  }
+  .act-dot{width:8px;height:8px;border-radius:50%;margin-top:3px;flex-shrink:0}
+  .act-text{font-size:11px;color:#444;line-height:1.4}
+  .act-time{font-size:10px;color:#bbb;margin-top:1px}
+
+  /* ─── SCREEN 2: Project Management ─── */
+  .pm-screen{flex:1;display:flex;flex-direction:column;overflow:hidden}
+  .pm-header{
+    padding:10px 14px 8px;background:#fff;
+    border-bottom:1px solid #f0f0f0;flex-shrink:0;
+    display:flex;align-items:center;gap:8px;
+  }
+  .back{font-size:18px;color:#C8A96E}
+  .pm-header h1{font-size:17px;font-weight:700;color:#111}
+  .notif-btn{margin-left:auto;position:relative;font-size:18px}
+  .notif-badge{
+    position:absolute;top:-2px;right:-2px;
+    width:14px;height:14px;background:#E05C6A;
+    border-radius:50%;font-size:8px;color:#fff;
+    display:flex;align-items:center;justify-content:center;font-weight:700;
+  }
+
+  /* CRM pinned card */
+  .crm-pin{
+    margin:10px 12px;
+    background:linear-gradient(135deg,#1a1a2e,#2d2055);
+    border-radius:16px;padding:12px 14px;flex-shrink:0;
+  }
+  .crm-pin-hdr{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+  .crm-tag{
+    background:#C8A96E22;border:1px solid #C8A96E55;
+    color:#C8A96E;font-size:9px;font-weight:700;
+    border-radius:6px;padding:2px 7px;text-transform:uppercase;letter-spacing:.5px;
+  }
+  .crm-pin-hdr span{color:rgba(255,255,255,.4);font-size:10px;margin-left:auto}
+  .crm-pipeline{display:flex;gap:6px}
+  .pipe-stage{
+    flex:1;background:rgba(255,255,255,.06);
+    border-radius:10px;padding:8px 7px;
+    display:flex;flex-direction:column;align-items:center;gap:4px;
+  }
+  .pipe-count{font-size:16px;font-weight:700;color:#fff}
+  .pipe-name{font-size:8px;color:rgba(255,255,255,.45);text-align:center;line-height:1.3}
+  .pipe-bar{width:100%;height:3px;border-radius:2px;margin-top:3px}
+  .new-lead .pipe-bar{background:#5B73E8}
+  .quoted  .pipe-bar{background:#C8A96E}
+  .won     .pipe-bar{background:#2E9B5F}
+  .lost    .pipe-bar{background:#E05C6A}
+
+  .crm-recent{margin-top:10px}
+  .crm-lead{
+    display:flex;align-items:center;gap:8px;
+    padding:5px 0;border-top:1px solid rgba(255,255,255,.06);
+  }
+  .lead-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+  .lead-name{font-size:11px;color:rgba(255,255,255,.85);flex:1}
+  .lead-stage{font-size:9px;color:rgba(255,255,255,.35)}
+
+  /* Projects list */
+  .pm-scroll{flex:1;overflow-y:auto;padding:4px 12px 12px}
+  .sec-title{font-size:10px;font-weight:700;color:#aaa;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 6px}
+  .proj-card{
+    background:#fff;border:1px solid #eee;border-radius:14px;
+    padding:11px 12px;margin-bottom:8px;
+    display:flex;align-items:center;gap:11px;
+  }
+  .av{
+    width:38px;height:38px;border-radius:11px;
+    display:flex;align-items:center;justify-content:center;
+    font-size:13px;font-weight:700;flex-shrink:0;
+  }
+  .av-g{background:#FFF0D6;color:#C8A96E}
+  .av-b{background:#EEF2FF;color:#5B73E8}
+  .av-gr{background:#E8F7EE;color:#2E9B5F}
+  .av-r{background:#FEE9EC;color:#E05C6A}
+  .av-p{background:#F3EEFF;color:#8B5CF6}
+  .proj-info{flex:1;min-width:0}
+  .proj-name{font-size:13px;font-weight:600;color:#111}
+  .proj-meta{font-size:10px;color:#999;margin-top:1px}
+  .badge{background:#C8A96E;color:#fff;font-size:9px;font-weight:700;border-radius:7px;padding:2px 6px}
+
+  .pm-tabs{
+    display:flex;height:52px;
+    background:#fff;border-top:1px solid #eee;flex-shrink:0;
+  }
+  .pm-tab{
+    flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+    font-size:8px;color:#bbb;cursor:pointer;
+  }
+  .pm-tab span:first-child{font-size:16px}
+  .pm-tab.act{color:#C8A96E}
+
+  /* ─── SCREEN 3: Timesheet ─── */
+  .ts-screen{flex:1;display:flex;flex-direction:column;overflow:hidden;background:#f7f7f7}
+  .ts-header{
+    padding:10px 14px 8px;background:#fff;
+    border-bottom:1px solid #f0f0f0;flex-shrink:0;
+    display:flex;align-items:center;gap:8px;
+  }
+  .ts-header h1{font-size:17px;font-weight:700;color:#111}
+  .ts-date{margin-left:auto;font-size:10px;color:#888;background:#f5f5f5;padding:4px 9px;border-radius:8px}
+
+  .ts-clock-card{
+    margin:12px;
+    background:linear-gradient(135deg,#1a2a4a,#2A3D7A);
+    border-radius:18px;padding:18px;flex-shrink:0;
+  }
+  .ts-clock-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+  .ts-worker{display:flex;align-items:center;gap:8px}
+  .ts-avatar{width:32px;height:32px;background:#5B73E822;border:1px solid #5B73E855;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#9BB5F5}
+  .ts-worker-info span{display:block}
+  .ts-worker-name{font-size:12px;font-weight:600;color:#fff}
+  .ts-worker-role{font-size:10px;color:rgba(255,255,255,.4)}
+  .ts-status-dot{display:flex;align-items:center;gap:5px}
+  .pulse{width:8px;height:8px;background:#2E9B5F;border-radius:50%;animation:pulse 1.5s infinite}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(1.3)}}
+  .ts-status-txt{font-size:10px;color:#2E9B5F;font-weight:600}
+
+  .ts-time-row{display:flex;gap:8px;margin-bottom:14px}
+  .ts-time-block{flex:1;background:rgba(255,255,255,.07);border-radius:12px;padding:10px}
+  .ts-time-lbl{font-size:9px;color:rgba(255,255,255,.4);margin-bottom:4px;text-transform:uppercase;letter-spacing:.4px}
+  .ts-time-val{font-size:17px;font-weight:700;color:#fff}
+  .ts-time-loc{font-size:9px;color:rgba(255,255,255,.3);margin-top:2px;display:flex;align-items:center;gap:3px}
+
+  .ts-proj-row{
+    background:rgba(255,255,255,.07);border-radius:12px;
+    padding:10px 12px;display:flex;align-items:center;gap:8px;margin-bottom:14px;
+  }
+  .ts-proj-icon{font-size:14px}
+  .ts-proj-name{font-size:12px;color:#fff;font-weight:600}
+  .ts-proj-hours{margin-left:auto;font-size:10px;color:#C8A96E;font-weight:600}
+
+  .ts-clock-btn{
+    width:100%;background:#C8A96E;color:#fff;
+    font-size:13px;font-weight:700;
+    border-radius:12px;padding:11px;
+    display:flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;
+  }
+
+  .ts-scroll{flex:1;overflow-y:auto;padding:0 12px 12px}
+  .ts-week{display:flex;gap:5px;padding:10px 12px;overflow-x:auto;flex-shrink:0;background:#fff;border-bottom:1px solid #f0f0f0}
+  .ts-day{
+    min-width:38px;height:54px;border-radius:11px;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+    flex-shrink:0;cursor:pointer;
+  }
+  .ts-day .d-name{font-size:9px;color:#bbb;text-transform:uppercase}
+  .ts-day .d-num{font-size:14px;font-weight:700;color:#444}
+  .ts-day.today{background:#2A3D7A}
+  .ts-day.today .d-name{color:rgba(255,255,255,.5)}
+  .ts-day.today .d-num{color:#fff}
+  .ts-day.has-entry .d-num{position:relative}
+  .ts-day.has-entry .d-num::after{content:'';position:absolute;bottom:-4px;left:50%;transform:translateX(-50%);width:4px;height:4px;background:#C8A96E;border-radius:50%}
+
+  .entry-card{
+    background:#fff;border:1px solid #eee;border-radius:14px;
+    padding:12px 13px;margin-bottom:8px;
+  }
+  .entry-hdr{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+  .entry-proj-av{width:30px;height:30px;background:#EEF2FF;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#5B73E8}
+  .entry-proj-name{font-size:12px;font-weight:600;color:#111}
+  .entry-workers{font-size:10px;color:#888}
+  .entry-hours{margin-left:auto;font-size:15px;font-weight:700;color:#2A3D7A}
+  .entry-bar-row{display:flex;align-items:center;gap:8px}
+  .entry-bar-bg{flex:1;height:5px;background:#f0f0f0;border-radius:3px;overflow:hidden}
+  .entry-bar-fill{height:100%;background:linear-gradient(90deg,#5B73E8,#C8A96E);border-radius:3px}
+  .entry-time-txt{font-size:10px;color:#bbb;white-space:nowrap}
+
+  .ts-tabs{display:flex;height:52px;background:#fff;border-top:1px solid #eee;flex-shrink:0}
+  .ts-tab{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:8px;color:#bbb}
+  .ts-tab span:first-child{font-size:16px}
+  .ts-tab.act{color:#2A3D7A}
+</style>
+</head>
+<body>
+
+<!-- ROW 1 -->
+<div class="row">
+
+  <!-- Screen 1: Mode Select / Home -->
+  <div class="wrap">
+    <div class="lbl">Home — Choose Mode</div>
+    <div class="phone">
+      <div class="screen">
+        <div class="sb"><span>9:41</span><div class="icons"><span>●●●</span><span>WiFi</span><span>🔋</span></div></div>
+        <div class="mode-screen">
+          <div class="mode-hero">
+            <div class="greeting">Good morning,</div>
+            <h1>Peter Kimani 👋</h1>
+            <div class="sub">Daya Interior Design · Doha</div>
+            <div class="notif-row">
+              <div class="notif-dot"></div>
+              <div class="notif-text">New lead: <strong>Al Waha Holdings</strong> via hello@wearedaya.com</div>
+              <div class="notif-time">2m</div>
+            </div>
+            <div class="notif-row" style="margin-top:5px">
+              <div class="notif-dot" style="background:#5B73E8"></div>
+              <div class="notif-text">Furniture delivery confirmed for <strong>Burj Investments</strong></div>
+              <div class="notif-time">1h</div>
+            </div>
+          </div>
+
+          <div class="quick-stats" style="margin-top:12px">
+            <div class="stat-chip"><div class="stat-num">12</div><div class="stat-lbl">Active Projects</div></div>
+            <div class="stat-chip"><div class="stat-num">5</div><div class="stat-lbl">Open Leads</div></div>
+            <div class="stat-chip"><div class="stat-num">34h</div><div class="stat-lbl">This Week</div></div>
+          </div>
+
+          <div class="mode-cards" style="margin-top:12px">
+            <div class="mode-card pm">
+              <div class="mode-icon">🗂️</div>
+              <div class="mode-info">
+                <h3>Project Management</h3>
+                <p>CRM pipeline · AI project Q&A · facts</p>
+              </div>
+              <div class="mode-arrow">›</div>
+            </div>
+            <div class="mode-card ts">
+              <div class="mode-icon">⏱️</div>
+              <div class="mode-info">
+                <h3>Timesheet</h3>
+                <p>Clock in/out · log hours · weekly view</p>
+              </div>
+              <div class="mode-arrow">›</div>
+            </div>
+          </div>
+
+          <div class="recent-section">
+            <div class="sec-hdr">Recent Activity</div>
+            <div class="activity-item">
+              <div class="act-dot" style="background:#C8A96E"></div>
+              <div>
+                <div class="act-text">Email processed: <strong>Natuzzi dining set delay</strong> — Burj Investments</div>
+                <div class="act-time">2 hours ago</div>
+              </div>
+            </div>
+            <div class="activity-item">
+              <div class="act-dot" style="background:#2E9B5F"></div>
+              <div>
+                <div class="act-text">Timesheet submitted by <strong>Ali Hassan</strong> · 7.5h on QNB Villa</div>
+                <div class="act-time">Yesterday</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 2: Project Management -->
+  <div class="wrap">
+    <div class="lbl">Project Management</div>
+    <div class="phone">
+      <div class="screen">
+        <div class="sb"><span>9:42</span><div class="icons"><span>●●●</span><span>WiFi</span><span>🔋</span></div></div>
+        <div class="pm-screen">
+          <div class="pm-header">
+            <span class="back">‹</span>
+            <h1>Projects</h1>
+            <div class="notif-btn">🔔<div class="notif-badge">3</div></div>
+          </div>
+
+          <!-- CRM pinned -->
+          <div class="crm-pin">
+            <div class="crm-pin-hdr">
+              <span class="crm-tag">📊 CRM</span>
+              <span>Pipeline · Apr 2026</span>
+            </div>
+            <div class="crm-pipeline">
+              <div class="pipe-stage new-lead">
+                <div class="pipe-count">5</div>
+                <div class="pipe-name">New Leads</div>
+                <div class="pipe-bar"></div>
+              </div>
+              <div class="pipe-stage quoted">
+                <div class="pipe-count">3</div>
+                <div class="pipe-name">Quoted</div>
+                <div class="pipe-bar"></div>
+              </div>
+              <div class="pipe-stage won">
+                <div class="pipe-count">8</div>
+                <div class="pipe-name">Won</div>
+                <div class="pipe-bar"></div>
+              </div>
+              <div class="pipe-stage lost">
+                <div class="pipe-count">1</div>
+                <div class="pipe-name">Lost</div>
+                <div class="pipe-bar"></div>
+              </div>
+            </div>
+            <div class="crm-recent">
+              <div class="crm-lead">
+                <div class="lead-dot" style="background:#5B73E8"></div>
+                <div class="lead-name">Al Waha Holdings</div>
+                <div class="lead-stage">New Lead · 2m ago</div>
+              </div>
+              <div class="crm-lead">
+                <div class="lead-dot" style="background:#C8A96E"></div>
+                <div class="lead-name">Gulf Architects LLC</div>
+                <div class="lead-stage">Quoted · 1d ago</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Projects -->
+          <div class="pm-scroll">
+            <div class="sec-title">Active Projects</div>
+            <div class="proj-card">
+              <div class="av av-g">BI</div>
+              <div class="proj-info">
+                <div class="proj-name">Burj Investments</div>
+                <div class="proj-meta">142 facts · last email 2h ago</div>
+              </div>
+              <div class="badge">3</div>
+            </div>
+            <div class="proj-card">
+              <div class="av av-b">QN</div>
+              <div class="proj-info">
+                <div class="proj-name">Qatar National Bank</div>
+                <div class="proj-meta">89 facts · yesterday</div>
+              </div>
+            </div>
+            <div class="proj-card">
+              <div class="av av-gr">AL</div>
+              <div class="proj-info">
+                <div class="proj-name">Al Rayyan Villas</div>
+                <div class="proj-meta">57 facts · 3 days ago</div>
+              </div>
+            </div>
+            <div class="proj-card">
+              <div class="av av-r">MP</div>
+              <div class="proj-info">
+                <div class="proj-name">Msheireb Properties</div>
+                <div class="proj-meta">211 facts · 1 week ago</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="pm-tabs">
+            <div class="pm-tab act"><span>🗂️</span><span>Projects</span></div>
+            <div class="pm-tab"><span>🔍</span><span>Search</span></div>
+            <div class="pm-tab"><span>🔔</span><span>Alerts</span></div>
+            <div class="pm-tab"><span>⚙️</span><span>Settings</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ROW 2 -->
+<div class="row">
+
+  <!-- Screen 3: Timesheet – Today -->
+  <div class="wrap">
+    <div class="lbl">Timesheet — Today</div>
+    <div class="phone">
+      <div class="screen">
+        <div class="sb"><span>9:43</span><div class="icons"><span>●●●</span><span>WiFi</span><span>🔋</span></div></div>
+        <div class="ts-screen">
+          <div class="ts-header">
+            <span class="back" style="color:#2A3D7A">‹</span>
+            <h1>Timesheet</h1>
+            <div class="ts-date">Sun 27 Apr</div>
+          </div>
+
+          <!-- Week strip -->
+          <div class="ts-week">
+            <div class="ts-day has-entry"><div class="d-name">Mon</div><div class="d-num">21</div></div>
+            <div class="ts-day has-entry"><div class="d-name">Tue</div><div class="d-num">22</div></div>
+            <div class="ts-day has-entry"><div class="d-name">Wed</div><div class="d-num">23</div></div>
+            <div class="ts-day has-entry"><div class="d-name">Thu</div><div class="d-num">24</div></div>
+            <div class="ts-day"><div class="d-name">Fri</div><div class="d-num">25</div></div>
+            <div class="ts-day"><div class="d-name">Sat</div><div class="d-num">26</div></div>
+            <div class="ts-day today"><div class="d-name">Sun</div><div class="d-num">27</div></div>
+          </div>
+
+          <!-- Active clock card -->
+          <div class="ts-clock-card" style="margin:10px 12px 0">
+            <div class="ts-clock-top">
+              <div class="ts-worker">
+                <div class="ts-avatar">PK</div>
+                <div class="ts-worker-info">
+                  <span class="ts-worker-name">Peter Kimani</span>
+                  <span class="ts-worker-role">Project Manager</span>
+                </div>
+              </div>
+              <div class="ts-status-dot">
+                <div class="pulse"></div>
+                <span class="ts-status-txt">Clocked in</span>
+              </div>
+            </div>
+
+            <div class="ts-time-row">
+              <div class="ts-time-block">
+                <div class="ts-time-lbl">Start</div>
+                <div class="ts-time-val">08:30</div>
+                <div class="ts-time-loc">📍 Burj St, Doha</div>
+              </div>
+              <div class="ts-time-block" style="border:1px dashed rgba(255,255,255,.15)">
+                <div class="ts-time-lbl">End</div>
+                <div class="ts-time-val" style="color:rgba(255,255,255,.3)">--:--</div>
+                <div class="ts-time-loc" style="color:rgba(255,255,255,.15)">● In progress</div>
+              </div>
+            </div>
+
+            <div class="ts-proj-row">
+              <span class="ts-proj-icon">🏗️</span>
+              <span class="ts-proj-name">Burj Investments</span>
+              <span class="ts-proj-hours">1h 12m</span>
+            </div>
+
+            <div class="ts-clock-btn" style="background:#E05C6A">
+              ⏹ Clock Out
+            </div>
+          </div>
+
+          <!-- Past entries -->
+          <div class="ts-scroll" style="margin-top:10px">
+            <div class="sec-title" style="padding:0 0 6px">Earlier This Week</div>
+
+            <div class="entry-card">
+              <div class="entry-hdr">
+                <div class="entry-proj-av">BI</div>
+                <div>
+                  <div class="entry-proj-name">Burj Investments</div>
+                  <div class="entry-workers">Peter Kimani · Thu 24 Apr</div>
+                </div>
+                <div class="entry-hours">7.5h</div>
+              </div>
+              <div class="entry-bar-row">
+                <div class="entry-bar-bg"><div class="entry-bar-fill" style="width:94%"></div></div>
+                <div class="entry-time-txt">08:00 – 15:30</div>
+              </div>
+            </div>
+
+            <div class="entry-card">
+              <div class="entry-hdr">
+                <div class="entry-proj-av" style="background:#E8F7EE;color:#2E9B5F">AL</div>
+                <div>
+                  <div class="entry-proj-name">Al Rayyan Villas</div>
+                  <div class="entry-workers">Peter, Ali Hassan · Wed 23</div>
+                </div>
+                <div class="entry-hours">6h</div>
+              </div>
+              <div class="entry-bar-row">
+                <div class="entry-bar-bg"><div class="entry-bar-fill" style="width:75%;background:linear-gradient(90deg,#2E9B5F,#C8A96E)"></div></div>
+                <div class="entry-time-txt">09:00 – 15:00</div>
+              </div>
+            </div>
+
+            <div class="entry-card">
+              <div class="entry-hdr">
+                <div class="entry-proj-av" style="background:#FEE9EC;color:#E05C6A">MP</div>
+                <div>
+                  <div class="entry-proj-name">Msheireb Properties</div>
+                  <div class="entry-workers">3 workers · Tue 22</div>
+                </div>
+                <div class="entry-hours">8h</div>
+              </div>
+              <div class="entry-bar-row">
+                <div class="entry-bar-bg"><div class="entry-bar-fill" style="width:100%;background:linear-gradient(90deg,#E05C6A,#C8A96E)"></div></div>
+                <div class="entry-time-txt">07:30 – 15:30</div>
+              </div>
+            </div>
+
+          </div>
+
+          <div class="ts-tabs">
+            <div class="ts-tab act"><span>⏱️</span><span>Today</span></div>
+            <div class="ts-tab"><span>📅</span><span>Weekly</span></div>
+            <div class="ts-tab"><span>👥</span><span>Team</span></div>
+            <div class="ts-tab"><span>📊</span><span>Reports</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 4: Timesheet – Clock In Flow -->
+  <div class="wrap">
+    <div class="lbl">Timesheet — Clock In Flow</div>
+    <div class="phone">
+      <div class="screen">
+        <div class="sb"><span>9:44</span><div class="icons"><span>●●●</span><span>WiFi</span><span>🔋</span></div></div>
+        <div class="ts-screen" style="background:#fff">
+          <div class="ts-header">
+            <span class="back" style="color:#2A3D7A">‹</span>
+            <h1>New Entry</h1>
+          </div>
+
+          <div style="padding:14px;flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+
+            <!-- Step: Workers -->
+            <div style="background:#f8f8f8;border-radius:14px;padding:13px">
+              <div style="font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Select Workers</div>
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:#fff;border:2px solid #2A3D7A;border-radius:11px">
+                  <div style="width:28px;height:28px;background:#EEF2FF;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#2A3D7A">PK</div>
+                  <span style="font-size:12px;font-weight:600;color:#111">Peter Kimani</span>
+                  <span style="margin-left:auto;font-size:16px">✅</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:#fff;border:1px solid #eee;border-radius:11px">
+                  <div style="width:28px;height:28px;background:#E8F7EE;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#2E9B5F">AH</div>
+                  <span style="font-size:12px;color:#444">Ali Hassan</span>
+                  <span style="margin-left:auto;font-size:16px">⬜️</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:#fff;border:1px solid #eee;border-radius:11px">
+                  <div style="width:28px;height:28px;background:#FEE9EC;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#E05C6A">MK</div>
+                  <span style="font-size:12px;color:#444">Mohamed Khalid</span>
+                  <span style="margin-left:auto;font-size:16px">⬜️</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Step: Project -->
+            <div style="background:#f8f8f8;border-radius:14px;padding:13px">
+              <div style="font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Select Project</div>
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:#fff;border:2px solid #C8A96E;border-radius:11px">
+                  <div style="width:28px;height:28px;background:#FFF0D6;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#C8A96E">BI</div>
+                  <span style="font-size:12px;font-weight:600;color:#111">Burj Investments</span>
+                  <span style="margin-left:auto;font-size:14px">✅</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:#fff;border:1px solid #eee;border-radius:11px">
+                  <div style="width:28px;height:28px;background:#EEF2FF;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#5B73E8">QN</div>
+                  <span style="font-size:12px;color:#444">Qatar National Bank</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Step: Time -->
+            <div style="background:#f8f8f8;border-radius:14px;padding:13px">
+              <div style="font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Start Time</div>
+              <div style="display:flex;gap:8px">
+                <div style="flex:1;background:#fff;border:2px solid #2A3D7A;border-radius:11px;padding:10px;text-align:center">
+                  <div style="font-size:11px;color:#888;margin-bottom:3px">Time</div>
+                  <div style="font-size:18px;font-weight:700;color:#2A3D7A">08:30</div>
+                </div>
+                <div style="background:#fff;border:1px solid #eee;border-radius:11px;padding:10px;min-width:80px;text-align:center">
+                  <div style="font-size:11px;color:#888;margin-bottom:3px">Location</div>
+                  <div style="font-size:10px;color:#2E9B5F">📍 Detected</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Clock In btn -->
+            <div class="ts-clock-btn" style="margin-top:auto">
+              ▶ Clock In Now
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>

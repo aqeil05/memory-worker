@@ -138,6 +138,24 @@ export async function sendDocument(botToken, chatId, fileBytes, filename, mimeTy
   return json;
 }
 
+// Send a photo that displays inline in the chat (full size, not as a file attachment)
+export async function sendPhoto(botToken, chatId, imageBytes, caption = "") {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("photo", new File([imageBytes], "diagram.png", { type: "image/png" }));
+  if (caption) {
+    form.append("caption", caption);
+    form.append("parse_mode", "HTML");
+  }
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+    method: "POST",
+    body: form,
+  });
+  const json = await res.json();
+  if (!json.ok) console.error("Telegram sendPhoto error:", JSON.stringify(json));
+  return json;
+}
+
 // Acknowledge a callback_query (required within 10s of receiving it)
 export async function answerCallback(botToken, callbackQueryId, text = "") {
   const res = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {

@@ -81,7 +81,7 @@ export function buildSummaryDocx(label, json) {
 //   party_actions[], commercial_summary[]
 // }
 // Also handles legacy format: timeline_narrative (string), commercial_summary (string), impact detail field
-export function buildReportDocx(topic, label, json) {
+export function buildReportDocx(topic, label, json, diagramPngBytes = null) {
   const h = json.header || {};
   const reportDate = h.date || new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 
@@ -117,6 +117,13 @@ export function buildReportDocx(topic, label, json) {
   }
   body.push(emptyPara());
 
+  // 4b. Visual Diagram (if generated via refine)
+  if (diagramPngBytes) {
+    body.push(h2("Visual Diagram"));
+    body.push(inlineImage("rId5"));
+    body.push(emptyPara());
+  }
+
   // 5. Current Impact Assessment
   if (json.impact_assessment?.length > 0) {
     body.push(h2("Current Impact Assessment"));
@@ -147,7 +154,7 @@ export function buildReportDocx(topic, label, json) {
   }
   body.push(emptyPara());
 
-  return buildDocx(body.join(""), `${topic} — ${label}`, reportDate);
+  return buildDocx(body.join(""), `${topic} — ${label}`, reportDate, diagramPngBytes);
 }
 
 // ── Report-specific OOXML section builders ─────────────────────────────────────
@@ -466,9 +473,34 @@ function escXml(str) {
     .replace(/'/g, "&apos;");
 }
 
+// ── Inline image OOXML (16:9, full content width = 6188000 × 3481000 EMU) ─────
+
+function inlineImage(relId) {
+  const cx = 6188000, cy = 3481000;
+  const WP  = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+  const A   = "http://schemas.openxmlformats.org/drawingml/2006/main";
+  const PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture";
+  return (
+    `<w:p><w:r><w:drawing>` +
+    `<wp:inline xmlns:wp="${WP}" distT="0" distB="0" distL="0" distR="0">` +
+    `<wp:extent cx="${cx}" cy="${cy}"/>` +
+    `<wp:effectExtent l="0" t="0" r="0" b="0"/>` +
+    `<wp:docPr id="1" name="Diagram"/>` +
+    `<a:graphic xmlns:a="${A}">` +
+    `<a:graphicData uri="${PIC}">` +
+    `<pic:pic xmlns:pic="${PIC}">` +
+    `<pic:nvPicPr><pic:cNvPr id="0" name="Diagram"/><pic:cNvPicPr/></pic:nvPicPr>` +
+    `<pic:blipFill><a:blip r:embed="${relId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+    `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
+    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
+    `</pic:pic></a:graphicData></a:graphic>` +
+    `</wp:inline></w:drawing></w:r></w:p>`
+  );
+}
+
 // ── Core docx builder ─────────────────────────────────────────────────────────
 
-function buildDocx(bodyXml, title, reportDate = "") {
+function buildDocx(bodyXml, title, reportDate = "", diagramPngBytes = null) {
   const enc = new TextEncoder();
   const safeTitle = escXml(title || "");
   const safeDate  = escXml(reportDate || new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }));
@@ -487,6 +519,7 @@ function buildDocx(bodyXml, title, reportDate = "") {
     `<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>` +
     `<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>` +
     `<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>` +
+    (diagramPngBytes ? `<Override PartName="/word/media/diagram.png" ContentType="image/png"/>` : "") +
     `</Types>`;
 
   const RELS =
@@ -502,6 +535,7 @@ function buildDocx(bodyXml, title, reportDate = "") {
     `<Relationship Id="rId2" Type="${R}/settings" Target="settings.xml"/>` +
     `<Relationship Id="rId3" Type="${R}/header" Target="header1.xml"/>` +
     `<Relationship Id="rId4" Type="${R}/footer" Target="footer1.xml"/>` +
+    (diagramPngBytes ? `<Relationship Id="rId5" Type="${R}/image" Target="media/diagram.png"/>` : "") +
     `</Relationships>`;
 
   const DOCUMENT =
@@ -566,6 +600,7 @@ function buildDocx(bodyXml, title, reportDate = "") {
     { name: "word/settings.xml",            data: enc.encode(SETTINGS) },
     { name: "word/header1.xml",             data: enc.encode(HEADER) },
     { name: "word/footer1.xml",             data: enc.encode(FOOTER) },
+    ...(diagramPngBytes ? [{ name: "word/media/diagram.png", data: new Uint8Array(diagramPngBytes) }] : []),
   ];
 
   return buildZip(files);

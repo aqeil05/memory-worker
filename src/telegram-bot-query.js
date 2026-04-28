@@ -569,8 +569,8 @@ Rules for specific fields:
 - commercial_summary: set flagged=true for expired quotes, unsigned payment certificates, or unquantified variation risks. If no commercial data exists, return one row with item="No commercial data available", value_ref="", notes_risk="", flagged=false.
 No markdown fences, no explanation, no extra text. Return ONLY the JSON object.`;
 
-// Pre-process the user's report topic with Haiku to expand keywords and define scope.
-// Returns { expandedKeywords, scopeNote, focusAreas } or null on failure (caller falls back).
+// Pre-process the user's report topic with Haiku to define precise scope.
+// Returns { expandedKeywords, excludeKeywords, scopeNote, focusAreas } or null on failure (caller falls back).
 async function expandReportTopic(env, topic, allFacts) {
   try {
     // Sample up to 60 unique subjects from facts so Haiku understands project vocabulary
@@ -586,12 +586,14 @@ async function expandReportTopic(env, topic, allFacts) {
       },
       body: JSON.stringify({
         model: HAIKU_MODEL,
-        max_tokens: 400,
-        system: `You are a search query expander for a construction/interior design project memory system.
+        max_tokens: 500,
+        system: `You are a report scope analyser for a construction/interior design project memory system.
 Given a report topic, output a JSON object with:
-- expanded_keywords: array of 8-15 search terms including synonyms, abbreviations, related concepts, and domain-specific terms that might appear in project emails
-- scope_note: one sentence clarifying what this report should focus on
-- focus_areas: array of 3-5 specific aspects the report should investigate
+- primary_keywords: array of 5-8 specific nouns or short phrases that define EXACTLY what this report is about (avoid generic verbs like "approval", "issue", "submit" — use specific object names)
+- entity_keywords: array of 2-4 person names, company names, or product names directly relevant to this topic
+- exclude_keywords: array of 4-8 terms that, if dominant in a fact, signal the fact belongs to a DIFFERENT workstream and is off-topic for this report (sibling tasks that share the same project)
+- scope_note: one sentence stating what IS and what is NOT in scope
+- focus_areas: array of 3-5 specific aspects to investigate
 Return ONLY valid JSON. No markdown, no explanation.`,
         messages: [{
           role: "user",
@@ -606,11 +608,16 @@ Return ONLY valid JSON. No markdown, no explanation.`,
     if (!raw) return null;
 
     const parsed = JSON.parse(extractFirstJsonObject(raw) ?? raw);
-    if (!Array.isArray(parsed.expanded_keywords) || !parsed.scope_note) return null;
+    if (!Array.isArray(parsed.primary_keywords) || !parsed.scope_note) return null;
 
-    console.log(`expandReportTopic: expanded "${topic}" → [${parsed.expanded_keywords.join(", ")}]`);
+    const primaryKw = (parsed.primary_keywords ?? []).map(k => String(k).toLowerCase());
+    const entityKw = (Array.isArray(parsed.entity_keywords) ? parsed.entity_keywords : []).map(k => String(k).toLowerCase());
+    const excludeKw = (Array.isArray(parsed.exclude_keywords) ? parsed.exclude_keywords : []).map(k => String(k).toLowerCase());
+
+    console.log(`expandReportTopic: include=[${[...primaryKw, ...entityKw].join(", ")}] exclude=[${excludeKw.join(", ")}]`);
     return {
-      expandedKeywords: parsed.expanded_keywords.map(k => String(k).toLowerCase()),
+      expandedKeywords: [...primaryKw, ...entityKw],
+      excludeKeywords: excludeKw,
       scopeNote: parsed.scope_note,
       focusAreas: Array.isArray(parsed.focus_areas) ? parsed.focus_areas : [],
     };
@@ -632,7 +639,7 @@ export async function handleReport(env, chatId, topic, project) {
   const expansion = await expandReportTopic(env, topic, allFacts);
 
   // Select relevant facts using thread-based scoring (same as Q&A, broader budget)
-  const selected = selectRelevantFacts(allFacts, topic, REPORT_MAX_SHORTLIST, expansion?.expandedKeywords ?? null);
+  const selected = selectRelevantFacts(allFacts, topic, REPORT_MAX_SHORTLIST, expansion?.expandedKeywords ?? null, expansion?.excludeKeywords ?? null);
 
   if (selected.length < 3) {
     return {
@@ -757,7 +764,17 @@ export async function handleReport(env, chatId, topic, project) {
 // ── Regenerate report with user feedback ──────────────────────────────────────
 
 export async function regenerateReport(env, chatId, topic, project, originalJson, feedback) {
-  const { label } = project;
+  const { company, label } = project;
+
+  // Fetch fresh facts so the refine pass can include information not yet in the JSON.
+  // selectRelevantFacts with the combined topic+feedback query surfaces facts the original
+  // run may have missed (e.g. user says "add more about the countertop approval").
+  const allFacts = await getAllProjectFacts(env, company);
+  const feedbackFacts = selectRelevantFacts(allFacts, `${topic} ${feedback}`, 60);
+
+  const additionalContext = feedbackFacts.length > 0
+    ? "\n\n" + buildReportContextBlock(`${topic} — additional context`, label, feedbackFacts, allFacts.length)
+    : "";
 
   const res = await claudeFetch(CLAUDE_API, {
     method: "POST",
@@ -768,15 +785,21 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
     },
     body: JSON.stringify({
       model: SONNET_MODEL,
-      max_tokens: 4000,
+      max_tokens: 8000,
       stream: true,
+      system: `You are a professional report writer for Daya Interior Design (Doha, Qatar).
+You are revising an existing project status report in JSON format based on user feedback.
+Preserve the exact JSON structure with all 8 fields: header, progress_snapshot, executive_summary, timeline, impact_assessment, decisions_required, party_actions, commercial_summary.
+Apply the feedback faithfully. Only include facts present in the original report JSON or the additional context block below — do not invent information.
+Return ONLY the revised JSON object. No markdown fences, no explanation, no extra text.`,
       messages: [{
         role: "user",
         content:
-          `You wrote this project status report for project "${label}", topic "${topic}":\n` +
-          `${JSON.stringify(originalJson, null, 2)}\n\n` +
-          `Please revise it based on this feedback: ${feedback}\n\n` +
-          `Return ONLY the revised JSON with the same structure, including all fields: header, progress_snapshot, executive_summary, timeline, impact_assessment, decisions_required, party_actions, and commercial_summary.`,
+          `Project: "${label}", topic: "${topic}"\n\n` +
+          `Current report JSON:\n${JSON.stringify(originalJson, null, 2)}` +
+          additionalContext +
+          `\n\nFeedback to apply: ${feedback}\n\n` +
+          `Return ONLY the revised JSON with all 8 fields intact.`,
       }],
     }),
   });
@@ -784,6 +807,7 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
   if (!res.ok) throw new Error(`Claude regenerate error: ${res.status}`);
 
   let rawText = "";
+  let stopReason = "unknown";
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -799,6 +823,8 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
         const event = JSON.parse(line.slice(6));
         if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
           rawText += event.delta.text;
+        } else if (event.type === "message_delta" && event.delta?.stop_reason) {
+          stopReason = event.delta.stop_reason;
         }
       } catch { /* skip malformed SSE line */ }
     }
@@ -809,10 +835,52 @@ export async function regenerateReport(env, chatId, topic, project, originalJson
     const extracted = extractFirstJsonObject(rawText.trim());
     json = JSON.parse(extracted ?? rawText.trim());
   } catch {
-    throw new Error("Claude returned invalid JSON for regenerated report");
+    console.error(`regenerateReport JSON parse failed. stop_reason=${stopReason} length=${rawText.length} tail=${rawText.slice(-200)}`);
+    throw new Error(`Claude returned invalid JSON for regenerated report (stop_reason: ${stopReason})`);
   }
 
-  return { text: formatReportText(topic, label, json), json };
+  return { text: formatReportText(topic, label, json), json, clarification: null };
+}
+
+// ── Visual diagram generation from refine feedback ───────────────────────────
+
+export async function generateDiagramForFeedback(env, topic, project, reportJson, feedback) {
+  const { label } = project;
+
+  const res = await claudeFetch(CLAUDE_API, {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: HAIKU_MODEL,
+      max_tokens: 1500,
+      system: `You generate Mermaid diagram code for interior design project status reports.
+Choose the best diagram type for the visualisation requested:
+- gantt for schedules, delays, or timelines with durations
+- timeline for simple chronological event sequences
+- flowchart for processes, approvals, or dependencies
+Return ONLY valid Mermaid code. No markdown fences, no explanation, no extra text.`,
+      messages: [{
+        role: "user",
+        content: `Project: "${label}", topic: "${topic}"\n\nReport data:\n${JSON.stringify(reportJson, null, 2)}\n\nVisualisation requested: ${feedback}\n\nGenerate the best Mermaid diagram.`,
+      }],
+    }),
+  });
+
+  if (!res.ok) throw new Error(`Claude Haiku diagram error: ${res.status}`);
+  const data = await res.json();
+  const mermaidCode = data.content?.[0]?.text?.trim() ?? "";
+  if (!mermaidCode) throw new Error("No Mermaid code returned");
+
+  const encoded = btoa(unescape(encodeURIComponent(mermaidCode)));
+  const imgRes = await fetch(`https://mermaid.ink/img/${encoded}`);
+  if (!imgRes.ok) throw new Error(`mermaid.ink render error: ${imgRes.status}`);
+  const imageBytes = await imgRes.arrayBuffer();
+
+  return { imageBytes, mermaidCode };
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -948,7 +1016,7 @@ function extractKeywords(question) {
 // + recency, then fills the budget with complete threads in score order.
 // This keeps thread context intact (MOM 008's 6 facts arrive together, not split apart)
 // and handles temporal queries ("latest", "most recent") correctly via recency weighting.
-function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST, overrideKeywords = null) {
+function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST, overrideKeywords = null, excludeKeywords = null) {
   const keywords = overrideKeywords ?? extractKeywords(question);
   const isTemporalQuery = /\b(latest|most recent|last|recent|newest|current)\b/i.test(question);
   const now = Date.now();
@@ -971,6 +1039,7 @@ function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST, ov
   const scoredThreads = [];
   for (const [tid, facts] of threads.entries()) {
     let kwScore = 0;
+    let excludeHits = 0;
     for (const fact of facts) {
       const text = (fact.fact || "").toLowerCase();
       const subj = (fact.subject || "").toLowerCase();
@@ -982,23 +1051,36 @@ function selectRelevantFacts(allFacts, question, maxCount = QA_MAX_SHORTLIST, ov
       // e.g. "what is the cost?" boosts facts tagged ["cost"] even if "cost" isn't in the fact text.
       // Graceful on old untagged facts — fact.tags will be undefined, optional chain short-circuits.
       if (fact.tags?.some(tag => questionLower.includes(tag))) kwScore += 1;
+      // Exclude penalty: count hits for off-topic workstream terms supplied by Haiku.
+      // Penalty is soft (deducted from score, not a hard filter) so a fact that mentions
+      // an excluded term in passing but is primarily about the topic still passes through.
+      if (excludeKeywords) {
+        for (const xkw of excludeKeywords) {
+          if (text.includes(xkw)) excludeHits += 1;
+        }
+      }
     }
+
+    // Net score: each exclude hit deducts 1.5 points. A thread dominated by off-topic
+    // workstream content (e.g. purely about lighting LPO when the topic is pantry furniture)
+    // ends up with netScore ≤ 0 and is filtered out.
+    const netScore = kwScore - excludeHits * 1.5;
 
     const latestDate = new Date(facts[facts.length - 1]?.emailDate || 0).getTime();
     const ageDays = (now - latestDate) / 86400000;
     const recencyScore = Math.max(0, 3 * (1 - ageDays / 365));
     const recencyWeight = isTemporalQuery ? 2.5 : 1;
 
-    scoredThreads.push({ tid, facts, score: kwScore + recencyScore * recencyWeight, kwScore });
+    scoredThreads.push({ tid, facts, score: netScore + recencyScore * recencyWeight, kwScore: netScore });
   }
 
-  // Sort threads by score descending; require at least one keyword hit to include
+  // Sort threads by score descending; require positive net score to include
   scoredThreads.sort((a, b) => b.score - a.score);
 
   // Greedily fill budget with complete threads
   const selected = [];
   for (const thread of scoredThreads) {
-    if (thread.kwScore === 0) continue;
+    if (thread.kwScore <= 0) continue;
     if (selected.length >= maxCount) break;
     const remaining = maxCount - selected.length;
     // Take all facts if they fit; otherwise take the most recent facts from the thread

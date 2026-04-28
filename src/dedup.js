@@ -155,6 +155,19 @@ export async function deleteRefinePending(kv, chatId) {
   await kv.delete(`tg:bot:refine:${chatId}`);
 }
 
+// ── Cancel flag — signals in-flight queue jobs to drop their results ──────────
+// Set by the "cancel" keyword; consumed (read + deleted) by queue workers.
+// TTL: 30 min — long enough to outlast any queued report job.
+
+export const setCancelFlag = (kv, chatId) =>
+  kv.put(`tg:bot:cancel:${chatId}`, "1", { expirationTtl: 1800 });
+
+export const checkAndClearCancelFlag = async (kv, chatId) => {
+  const val = await kv.get(`tg:bot:cancel:${chatId}`);
+  if (val) await kv.delete(`tg:bot:cancel:${chatId}`);
+  return !!val;
+};
+
 // ── Active mode (qa / timeline / report) ─────────────────────────────────────
 // Persistent mode state — all plain messages are handled by the active mode
 // until the user types /bot (no args) to reset.

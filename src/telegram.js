@@ -16,7 +16,7 @@
 //   /bot companies · /bot merge · /bot backfill · /bot projects
 //   /bot addproject · /bot archiveproject · /bot alias · /bot alias list
 
-import { handleBotQuery, handleSummary, handleReport, regenerateReport, handleTimeline } from "./telegram-bot-query.js";
+import { handleBotQuery, handleSummary, handleReport, regenerateReport, handleTimeline, generateDiagramForFeedback } from "./telegram-bot-query.js";
 import { linkGroup, getGroupProject, uploadReport, downloadItemAsPdf, uploadPdfReport, matchingCompanies, getAllCompanies, mergeCompany, getActiveProjects, addActiveProject, archiveProject } from "./onedrive.js";
 import { normalizeCompany, isValidCompanyName, setAlias, listAliases } from "./memory.js";
 import { buildSummaryDocx, buildReportDocx } from "./docx.js";
@@ -25,9 +25,10 @@ import {
   getDraft, setDraft, deleteDraft,
   getRefinePending, setRefinePending, deleteRefinePending,
   getActiveMode, setActiveMode, deleteActiveMode,
+  setCancelFlag, checkAndClearCancelFlag,
   isRateLimited, incrementRateLimit,
 } from "./dedup.js";
-import { sendMessage, sendLongMessage, sendWithButtons, answerCallback, escHtml, sendChatAction, pinMessage, sendDocument } from "./notify.js";
+import { sendMessage, sendLongMessage, sendWithButtons, answerCallback, escHtml, sendChatAction, pinMessage, sendDocument, sendPhoto } from "./notify.js";
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -74,6 +75,20 @@ export async function handleTelegramUpdate(request, env, ctx) {
 
 async function handleGroupMessage(env, ctx, chatId, text) {
   try {
+    // "cancel" clears all pending/active state and kills in-flight queue jobs
+    if (text.trim().toLowerCase() === "cancel") {
+      await Promise.all([
+        deleteBotPending(env.DAYA_KV, chatId),
+        deleteDraft(env.DAYA_KV, chatId),
+        deleteRefinePending(env.DAYA_KV, chatId),
+        deleteActiveMode(env.DAYA_KV, chatId),
+        setCancelFlag(env.DAYA_KV, chatId),
+      ]);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "✅ Cancelled. All pending operations cleared.");
+      return;
+    }
+
     if (text.startsWith("/link") || text.startsWith("/start")) {
       await handleLink(env, chatId, text);
       return;
@@ -409,6 +424,10 @@ export async function runReportTask(env, chatId, topic, project) {
   console.log(`runReportTask start [${chatId}] topic="${topic}" project="${project?.company}"`);
   try {
     const { text: reportText, json } = await handleReport(env, chatId, topic, project);
+    if (await checkAndClearCancelFlag(env.DAYA_KV, chatId)) {
+      console.log(`runReportTask cancelled [${chatId}]`);
+      return;
+    }
     await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
 
     if (json) {
@@ -420,6 +439,7 @@ export async function runReportTask(env, chatId, topic, project) {
           { text: "📑 Export as PDF",  callback_data: "export_report_pdf" },
         ], [
           { text: "✏️ Refine", callback_data: "refine_report" },
+          { text: "❌ Cancel",  callback_data: "cancel_report" },
         ]]
       );
     }
@@ -429,6 +449,49 @@ export async function runReportTask(env, chatId, topic, project) {
     await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
       `❌ Report generation failed: ${escHtml(err.message)}`
     ).catch(() => {});
+  }
+}
+
+// ── Queue consumer: refine existing report with user feedback ─────────────────
+// Runs without wall-clock limit in the queue consumer (up to 15 min).
+
+export async function runRefineTask(env, { chatId, topic, project, json, feedback, iteration, diagramMermaid }) {
+  // Keep typing indicator alive every 4s for the full duration of Claude streaming
+  sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+  const typingInterval = setInterval(() => {
+    sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+  }, 4000);
+  try {
+    const result = await regenerateReport(env, chatId, topic, project, json, feedback);
+    const { text: reportText, json: newJson } = result;
+    if (await checkAndClearCancelFlag(env.DAYA_KV, chatId)) {
+      console.log(`runRefineTask cancelled [${chatId}]`);
+      return;
+    }
+    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
+    if (newJson) {
+      await setDraft(env.DAYA_KV, chatId, {
+        type: "report", topic, project, json: newJson, iteration: iteration + 1,
+        ...(diagramMermaid ? { diagram: diagramMermaid } : {}),
+      });
+      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "What would you like to do with this report?",
+        [[
+          { text: "📄 Export as Word", callback_data: "export_report" },
+          { text: "📑 Export as PDF",  callback_data: "export_report_pdf" },
+        ], [
+          { text: "✏️ Refine", callback_data: "refine_report" },
+          { text: "❌ Cancel",  callback_data: "cancel_report" },
+        ]]
+      );
+    }
+  } catch (err) {
+    console.error(`runRefineTask failed [${chatId}]: ${err.stack || err.message}`);
+    await setDraft(env.DAYA_KV, chatId, { type: "report", topic, project, json, iteration });
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      "⚠️ Refine failed — tap <b>✏️ Refine</b> again to retry.").catch(() => {});
+  } finally {
+    clearInterval(typingInterval);
   }
 }
 
@@ -549,7 +612,15 @@ async function handleCallbackQuery(env, ctx, chatId, data, callbackQueryId) {
         return;
       }
       await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Generating Word document...");
-      const docx = buildReportDocx(draft.topic, draft.project.label, draft.json);
+      let diagramPng = null;
+      if (draft.diagram) {
+        try {
+          const encoded = btoa(unescape(encodeURIComponent(draft.diagram)));
+          const imgRes = await fetch(`https://mermaid.ink/img/${encoded}`);
+          if (imgRes.ok) diagramPng = await imgRes.arrayBuffer();
+        } catch { /* non-fatal — export without diagram */ }
+      }
+      const docx = buildReportDocx(draft.topic, draft.project.label, draft.json, diagramPng);
       const topicSlug = safeName(draft.topic || "report").slice(0, 30);
       const filename = `${safeName(draft.project.label)}_Report_${topicSlug}_${today()}.docx`;
       await uploadReport(env, filename, docx);
@@ -566,7 +637,15 @@ async function handleCallbackQuery(env, ctx, chatId, data, callbackQueryId) {
         return;
       }
       await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Generating PDF...");
-      const docx = buildReportDocx(draft.topic, draft.project.label, draft.json);
+      let diagramPng = null;
+      if (draft.diagram) {
+        try {
+          const encoded = btoa(unescape(encodeURIComponent(draft.diagram)));
+          const imgRes = await fetch(`https://mermaid.ink/img/${encoded}`);
+          if (imgRes.ok) diagramPng = await imgRes.arrayBuffer();
+        } catch { /* non-fatal — export without diagram */ }
+      }
+      const docx = buildReportDocx(draft.topic, draft.project.label, draft.json, diagramPng);
       const topicSlug = safeName(draft.topic || "report").slice(0, 30);
       const docxFilename = `${safeName(draft.project.label)}_Report_${topicSlug}_${today()}.docx`;
       const { id: itemId } = await uploadReport(env, docxFilename, docx);
@@ -593,6 +672,13 @@ async function handleCallbackQuery(env, ctx, chatId, data, callbackQueryId) {
         "✏️ <b>What should be added or changed?</b>\n\n" +
         "Describe the changes, e.g. \"emphasise the cost impact\" or \"add more detail about the delay timeline\"."
       );
+      return;
+    }
+
+    if (data === "cancel_report") {
+      await deleteDraft(env.DAYA_KV, chatId);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+        "🗑️ Report discarded. Run <code>/bot report</code> to start a new one.");
       return;
     }
 
@@ -944,24 +1030,41 @@ async function handleRefineText(env, chatId, feedback, refinePending) {
 
   const { topic, project, json, iteration } = refinePending;
 
-  await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Refining report...");
+  const effectiveFeedback = refinePending.awaitingClarification
+    ? `${refinePending.originalFeedback}\n\nAdditional context provided by user:\n${feedback}`
+    : feedback;
 
-  const { text: reportText, json: newJson } = await regenerateReport(env, chatId, topic, project, json, feedback);
-  await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
+  const isVisual = /\b(visual|diagram|chart|graph|gantt|visuali[sz]|demo|illustrat|timeline\s+diagram)\b/i.test(effectiveFeedback);
 
-  if (newJson) {
-    await setDraft(env.DAYA_KV, chatId, {
-      type: "report", topic, project, json: newJson, iteration: iteration + 1,
+  let diagramMermaid = null;
+  if (isVisual) {
+    // Typing indicator covers diagram generation — the queue consumer handles report typing
+    sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+    const typingInterval = setInterval(() => {
+      sendChatAction(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId).catch(() => {});
+    }, 4000);
+    try {
+      const { imageBytes, mermaidCode } = await generateDiagramForFeedback(env, topic, project, json, effectiveFeedback);
+      await sendPhoto(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, imageBytes, "📊 <b>Visual Diagram</b>");
+      diagramMermaid = mermaidCode;
+    } catch (diagErr) {
+      console.error(`Diagram generation error: ${diagErr.message}`);
+      await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⚠️ Could not generate diagram — continuing with text refinement.");
+    } finally {
+      clearInterval(typingInterval);
+    }
+  }
+
+  // Enqueue text refinement — queue consumer runs without wall-clock limit
+  try {
+    await env.REPORT_QUEUE.send({
+      type: "refine", chatId, topic, project, json, feedback: effectiveFeedback, iteration, diagramMermaid,
     });
-    await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-      "What would you like to do with this report?",
-      [[
-        { text: "📄 Export as Word", callback_data: "export_report" },
-        { text: "📑 Export as PDF",  callback_data: "export_report_pdf" },
-      ], [
-        { text: "✏️ Refine", callback_data: "refine_report" },
-      ]]
-    );
+  } catch (queueErr) {
+    console.error(`Failed to enqueue refine [${chatId}]: ${queueErr.message}`);
+    await setDraft(env.DAYA_KV, chatId, { type: "report", topic, project, json, iteration });
+    await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
+      "⚠️ Refine failed — tap <b>✏️ Refine</b> again to retry.");
   }
 }
 
@@ -1047,21 +1150,16 @@ async function handleModeReport(env, ctx, chatId, text, modeState) {
     }
     await setActiveMode(env.DAYA_KV, chatId, modeState);  // refresh TTL
     await sendMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, "⏳ Refining report...");
-    const { text: reportText, json: newJson } = await regenerateReport(
-      env, chatId, draft.topic, draft.project, draft.json, text);
-    await sendLongMessage(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId, reportText);
-    if (newJson) {
-      const iteration = (draft.iteration || 1) + 1;
-      await setDraft(env.DAYA_KV, chatId, { ...draft, json: newJson, iteration });
-      await sendWithButtons(env.TELEGRAM_MEMORY_BOT_TOKEN, chatId,
-        "What would you like to do with this report?",
-        [[
-          { text: "📄 Export as Word", callback_data: "export_report" },
-          { text: "📑 Export as PDF",  callback_data: "export_report_pdf" },
-        ], [
-          { text: "✏️ Refine",         callback_data: "refine_report" },
-        ]]);
-    }
+    await env.REPORT_QUEUE.send({
+      type: "refine",
+      chatId,
+      topic: draft.topic,
+      project: draft.project,
+      json: draft.json,
+      feedback: text,
+      iteration: draft.iteration || 1,
+      diagramMermaid: null,
+    });
   }
 }
 
